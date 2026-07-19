@@ -90,18 +90,12 @@ function patchSuperPropsBase64(existingBase64: string): string {
 }
 
 /**
- * All quest-related endpoints that need X-Super-Properties spoofed.
+ * Quest-related progress endpoints (enroll/heartbeat).
+ * We require a trailing slash to explicitly avoid spoofing the main quest list endpoint 
+ * (/users/@me/quests). Spoofing the list endpoint hides computer quests and returns 
+ * empty if no mobile quests exist!
  */
-function isQuestRelatedUrl(url: string): boolean {
-    return url.includes("/quests") || url.includes("/drops");
-}
-
-/**
- * Specifically quest progress endpoints (enroll/heartbeat).
- * These need User-Agent spoofing to bypass Discord anti-cheat, 
- * whereas the quest list endpoint doesn't.
- */
-function isQuestProgressUrl(url: string): boolean {
+function isQuestUrl(url: string): boolean {
     return url.includes("/quests/") || url.includes("/drops/");
 }
 
@@ -150,7 +144,7 @@ export default definePlugin({
             return originalWsSend!.call(this, data);
         };
 
-        // ── 2. window.fetch — patch headers on quest endpoints ──────────
+        // ── 2. window.fetch — patch headers on quest progress endpoints ──────
         originalFetch = window.fetch;
         window.fetch = function (input: RequestInfo | URL, init?: RequestInit) {
             try {
@@ -158,7 +152,7 @@ export default definePlugin({
                     : input instanceof URL ? input.href
                         : String(input);
 
-                if (!isDiscordApiUrl(url) || !isQuestRelatedUrl(url)) {
+                if (!isDiscordApiUrl(url) || !isQuestUrl(url)) {
                     return originalFetch!.call(this, input, init);
                 }
 
@@ -172,11 +166,9 @@ export default definePlugin({
                     headers.set("X-Super-Properties", patchSuperPropsBase64(existingProps));
                 }
 
-                // Only spoof User-Agent for active progress endpoints to avoid Cloudflare 403 on the list fetch
-                if (isQuestProgressUrl(url)) {
-                    const { os } = getPlatformInfo();
-                    headers.set("User-Agent", getSpoofedUserAgent(os));
-                }
+                // Spoof User-Agent for active progress endpoints
+                const { os } = getPlatformInfo();
+                headers.set("User-Agent", getSpoofedUserAgent(os));
 
                 if (input instanceof Request) {
                     return originalFetch!.call(this, new Request(input, { ...init, headers }));
@@ -188,7 +180,7 @@ export default definePlugin({
             }
         } as typeof window.fetch;
 
-        // ── 3. XMLHttpRequest — patch headers on quest endpoints ────────
+        // ── 3. XMLHttpRequest — patch headers on quest progress endpoints ────
         originalXhrOpen = XMLHttpRequest.prototype.open;
         originalXhrSetHeader = XMLHttpRequest.prototype.setRequestHeader;
 
@@ -206,7 +198,7 @@ export default definePlugin({
             const res = (originalXhrOpen as any).call(this, method, url, ...rest);
 
             // Set User-Agent for quest progress URLs on open
-            if (isDiscordApiUrl(urlStr) && isQuestProgressUrl(urlStr)) {
+            if (isDiscordApiUrl(urlStr) && isQuestUrl(urlStr)) {
                 try {
                     const { os } = getPlatformInfo();
                     originalXhrSetHeader!.call(this, "User-Agent", getSpoofedUserAgent(os));
@@ -222,11 +214,11 @@ export default definePlugin({
             value: string
         ) {
             const url = xhrUrlMap.get(this) ?? "";
-            if (isDiscordApiUrl(url) && isQuestRelatedUrl(url)) {
+            if (isDiscordApiUrl(url) && isQuestUrl(url)) {
                 const lowerName = name.toLowerCase();
                 if (lowerName === "x-super-properties") {
                     value = patchSuperPropsBase64(value);
-                } else if (lowerName === "user-agent" && isQuestProgressUrl(url)) {
+                } else if (lowerName === "user-agent") {
                     const { os } = getPlatformInfo();
                     value = getSpoofedUserAgent(os);
                 }
