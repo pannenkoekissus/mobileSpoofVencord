@@ -7,8 +7,6 @@
 import { definePluginSettings } from "@api/Settings";
 import { Devs } from "@utils/constants";
 import definePlugin, { OptionType, StartAt } from "@utils/types";
-import { waitFor } from "@webpack";
-
 // ─── Settings ────────────────────────────────────────────────────────────────
 
 const settings = definePluginSettings({
@@ -29,9 +27,6 @@ let originalFetch: typeof window.fetch | null = null;
 let originalXhrOpen: typeof XMLHttpRequest.prototype.open | null = null;
 let originalXhrSetHeader: typeof XMLHttpRequest.prototype.setRequestHeader | null = null;
 let originalWsSend: typeof WebSocket.prototype.send | null = null;
-let superPropsModule: any = null;
-let originalGetSuperProperties: any = null;
-let originalGetSuperPropertiesBase64: any = null;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -42,6 +37,17 @@ function getPlatformInfo() {
         browser: isIOS ? "Discord iOS" : "Discord Android",
         device: isIOS ? "Discord iOS" : "Discord Android"
     };
+}
+
+function getSpoofedUserAgent(os: string): string {
+    if (os === "iOS") {
+        return "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1";
+    }
+    
+    // For Android, extract current Chrome version to perfectly match TLS fingerprint
+    const match = navigator.userAgent.match(/Chrome\/(\d+\.\d+\.\d+\.\d+)/);
+    const chromeVersion = match ? match[1] : "126.0.0.0";
+    return `Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${chromeVersion} Mobile Safari/537.36`;
 }
 
 /**
@@ -68,7 +74,7 @@ function patchSuperPropsBase64(existingBase64: string): string {
  * We intentionally do NOT touch other Discord API calls.
  */
 function isQuestUrl(url: string): boolean {
-    return url.includes("/drops/") || url.includes("/quests/");
+    return url.includes("/quests") || url.includes("/drops");
 }
 
 function isDiscordApiUrl(url: string): boolean {
@@ -81,28 +87,6 @@ function isDiscordApiUrl(url: string): boolean {
         url.includes("discord.com/api") ||
         url.includes("discordapp.com/api")
     );
-}
-
-/**
- * Helper to safely redefine properties of objects (handles read-only and getters).
- */
-function overrideProperty(obj: any, prop: string, newValue: any): any {
-    const originalValue = obj ? obj[prop] : undefined;
-    if (obj) {
-        try {
-            Object.defineProperty(obj, prop, {
-                value: newValue,
-                writable: true,
-                configurable: true,
-                enumerable: true
-            });
-        } catch {
-            try {
-                obj[prop] = newValue;
-            } catch { /* ignore */ }
-        }
-    }
-    return originalValue;
 }
 
 // ─── Plugin ───────────────────────────────────────────────────────────────────
@@ -138,7 +122,7 @@ export default definePlugin({
             return originalWsSend!.call(this, data);
         };
 
-        // ── 2. window.fetch — only patch X-Super-Properties on quest endpoints ─
+        // ── 2. window.fetch — only patch headers on quest endpoints ──────────
         originalFetch = window.fetch;
         window.fetch = function (input: RequestInfo | URL, init?: RequestInit) {
             try {
@@ -146,7 +130,7 @@ export default definePlugin({
                     : input instanceof URL ? input.href
                         : String(input);
 
-                if (!isDiscordApiUrl(url)) {
+                if (!isDiscordApiUrl(url) || !isQuestUrl(url)) {
                     return originalFetch!.call(this, input, init);
                 }
 
@@ -160,14 +144,9 @@ export default definePlugin({
                     headers.set("X-Super-Properties", patchSuperPropsBase64(existingProps));
                 }
 
-                // For quest heartbeat/progress endpoints, also spoof the User-Agent
-                if (isQuestUrl(url)) {
-                    const { os } = getPlatformInfo();
-                    const mobileUA = os === "iOS"
-                        ? "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
-                        : "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36";
-                    headers.set("User-Agent", mobileUA);
-                }
+                // For quest endpoints, also spoof the User-Agent
+                const { os } = getPlatformInfo();
+                headers.set("User-Agent", getSpoofedUserAgent(os));
 
                 if (input instanceof Request) {
                     return originalFetch!.call(this, new Request(input, { ...init, headers }));
@@ -179,7 +158,7 @@ export default definePlugin({
             }
         } as typeof window.fetch;
 
-        // ── 3. XMLHttpRequest — only patch X-Super-Properties header ─────────
+        // ── 3. XMLHttpRequest — only patch headers on quest endpoints ────────
         originalXhrOpen = XMLHttpRequest.prototype.open;
         originalXhrSetHeader = XMLHttpRequest.prototype.setRequestHeader;
 
@@ -200,10 +179,7 @@ export default definePlugin({
             if (isDiscordApiUrl(urlStr) && isQuestUrl(urlStr)) {
                 try {
                     const { os } = getPlatformInfo();
-                    const mobileUA = os === "iOS"
-                        ? "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
-                        : "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36";
-                    originalXhrSetHeader!.call(this, "User-Agent", mobileUA);
+                    originalXhrSetHeader!.call(this, "User-Agent", getSpoofedUserAgent(os));
                 } catch { /* ignore */ }
             }
 
@@ -216,43 +192,17 @@ export default definePlugin({
             value: string
         ) {
             const url = xhrUrlMap.get(this) ?? "";
-            if (isDiscordApiUrl(url)) {
+            if (isDiscordApiUrl(url) && isQuestUrl(url)) {
                 const lowerName = name.toLowerCase();
                 if (lowerName === "x-super-properties") {
                     value = patchSuperPropsBase64(value);
-                } else if (lowerName === "user-agent" && isQuestUrl(url)) {
+                } else if (lowerName === "user-agent") {
                     const { os } = getPlatformInfo();
-                    value = os === "iOS"
-                        ? "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
-                        : "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36";
+                    value = getSpoofedUserAgent(os);
                 }
             }
             return originalXhrSetHeader!.call(this, name, value);
         };
-
-        // ── 4. Webpack getSuperProperties module ─────────────────────────────
-        waitFor(["getSuperProperties", "getSuperPropertiesBase64"], mod => {
-            if (!originalWsSend) return; // plugin has been stopped already
-
-            superPropsModule = mod;
-            originalGetSuperProperties = mod.getSuperProperties;
-            originalGetSuperPropertiesBase64 = mod.getSuperPropertiesBase64;
-
-            overrideProperty(mod, "getSuperProperties", function () {
-                const props = originalGetSuperProperties.apply(this, arguments);
-                const { os, browser, device } = getPlatformInfo();
-                // Only change the identity fields, leave everything else untouched
-                props.os = os;
-                props.browser = browser;
-                props.device = device;
-                return props;
-            });
-
-            overrideProperty(mod, "getSuperPropertiesBase64", function () {
-                const props = mod.getSuperProperties.apply(this, arguments);
-                return btoa(unescape(encodeURIComponent(JSON.stringify(props))));
-            });
-        });
     },
 
     stop() {
@@ -271,17 +221,6 @@ export default definePlugin({
         if (originalXhrSetHeader) {
             XMLHttpRequest.prototype.setRequestHeader = originalXhrSetHeader;
             originalXhrSetHeader = null;
-        }
-        if (superPropsModule) {
-            if (originalGetSuperProperties) {
-                overrideProperty(superPropsModule, "getSuperProperties", originalGetSuperProperties);
-            }
-            if (originalGetSuperPropertiesBase64) {
-                overrideProperty(superPropsModule, "getSuperPropertiesBase64", originalGetSuperPropertiesBase64);
-            }
-            superPropsModule = null;
-            originalGetSuperProperties = null;
-            originalGetSuperPropertiesBase64 = null;
         }
     }
 });
