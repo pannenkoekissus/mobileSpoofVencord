@@ -57,6 +57,8 @@ async function enrollInQuest(questId: string, questName: string) {
                 body: `Enrolled in "${questName}".`,
                 color: "#3ba55c"
             });
+            // Update UI and re-run store patch
+            patchQuestsInStore();
             updateFloatingUI();
         } else {
             showNotification({
@@ -75,6 +77,57 @@ async function enrollInQuest(questId: string, questName: string) {
     }
 }
 
+// ─── Quest Store Patching (Converts Mobile tasks to Desktop tasks) ─────────────
+
+function patchQuestsInStore() {
+    if (!QuestsStore || !QuestsStore.quests) return;
+
+    let anyModified = false;
+    for (const quest of QuestsStore.quests.values()) {
+        let modified = false;
+
+        // 1. Ensure platform 1 (Desktop) is supported so card is not locked/hidden
+        if (quest.config && Array.isArray(quest.config.platforms)) {
+            if (!quest.config.platforms.includes(1)) {
+                quest.config.platforms.push(1);
+                modified = true;
+            }
+        }
+
+        // 2. Map mobile task types to desktop task types so UI renders official buttons
+        const taskConfig = quest.config?.taskConfig ?? quest.config?.taskConfigV2;
+        if (taskConfig?.tasks) {
+            // Video task mapping
+            if (taskConfig.tasks.WATCH_VIDEO_ON_MOBILE && !taskConfig.tasks.WATCH_VIDEO) {
+                taskConfig.tasks.WATCH_VIDEO = taskConfig.tasks.WATCH_VIDEO_ON_MOBILE;
+                delete taskConfig.tasks.WATCH_VIDEO_ON_MOBILE;
+                modified = true;
+            }
+            // Game activity task mapping
+            if (taskConfig.tasks.PLAY_ON_MOBILE && !taskConfig.tasks.PLAY_ON_DESKTOP) {
+                taskConfig.tasks.PLAY_ON_DESKTOP = taskConfig.tasks.PLAY_ON_MOBILE;
+                delete taskConfig.tasks.PLAY_ON_MOBILE;
+                modified = true;
+            }
+        }
+
+        if (modified) {
+            anyModified = true;
+            console.log("[MobileSpoof] Patched quest to desktop type in store:", quest.id, 
+                quest.config?.messages?.questName ?? quest.config?.application?.name);
+        }
+    }
+
+    if (anyModified) {
+        try {
+            // Trigger Flux store update so React UI refreshes and shows official buttons
+            QuestsStore.emitChange();
+        } catch (e) {
+            console.error("[MobileSpoof] emitChange error:", e);
+        }
+    }
+}
+
 // ─── Floating UI ──────────────────────────────────────────────────────────────
 
 function updateFloatingUI() {
@@ -88,12 +141,16 @@ function updateFloatingUI() {
 
     const allQuests = [...(QuestsStore.quests?.values() ?? [])];
 
-    // Detect mobile quests by task type, NOT platforms array.
+    // Detect mobile quests (original configs might have been patched, check both maps)
     const mobileQuests = allQuests.filter((q: any) => {
         const taskConfig = q?.config?.taskConfig ?? q?.config?.taskConfigV2;
         if (!taskConfig?.tasks) return false;
-        const hasMobileTask = MOBILE_TASK_TYPES.some(t => taskConfig.tasks[t] != null);
-        return hasMobileTask;
+        return (
+            taskConfig.tasks.WATCH_VIDEO_ON_MOBILE != null || 
+            taskConfig.tasks.PLAY_ON_MOBILE != null ||
+            // Or if we already patched it (we log it for the floating UI status)
+            (q.config.platforms.includes(1) && (taskConfig.tasks.WATCH_VIDEO != null || taskConfig.tasks.PLAY_ON_DESKTOP != null))
+        );
     });
 
     console.log("[MobileSpoof] Mobile quests found:", mobileQuests.length, "/", allQuests.length);
@@ -248,13 +305,17 @@ export default definePlugin({
         waitFor(["getQuest", "quests"], store => {
             if (!originalWsSend) return;
             QuestsStore = store;
+            patchQuestsInStore();
             updateFloatingUI();
         });
 
-        // ── 4. Floating UI — deferred until document.body exists ─────────────
+        // ── 4. Floating UI & Patch loop ──────────────────────────────────────
         observer = new MutationObserver(() => {
             if (observerThrottle) clearTimeout(observerThrottle);
-            observerThrottle = setTimeout(() => updateFloatingUI(), 500);
+            observerThrottle = setTimeout(() => {
+                patchQuestsInStore();
+                updateFloatingUI();
+            }, 500);
         });
 
         const initUI = () => {
@@ -263,6 +324,7 @@ export default definePlugin({
                 return;
             }
             createFloatingUI();
+            patchQuestsInStore();
             updateFloatingUI();
             observer!.observe(document.body, { childList: true, subtree: true });
         };
