@@ -4,11 +4,11 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-import { definePluginSettings } from "@api/Settings";
 import { showNotification } from "@api/Notifications";
+import { definePluginSettings } from "@api/Settings";
 import { Devs } from "@utils/constants";
 import definePlugin, { OptionType, StartAt } from "@utils/types";
-import { waitFor } from "@webpack";
+import { findByPropsLazy, waitFor } from "@webpack";
 
 // ─── Settings ────────────────────────────────────────────────────────────────
 
@@ -24,6 +24,11 @@ const settings = definePluginSettings({
     }
 });
 
+// ─── Internal Modules (lazy — available after Discord loads) ──────────────────
+
+// Discord's authenticated REST API client — handles auth token automatically
+const RestAPI = findByPropsLazy("getAPIBaseURL", "get", "post");
+
 // ─── State ────────────────────────────────────────────────────────────────────
 
 let originalWsSend: typeof WebSocket.prototype.send | null = null;
@@ -32,80 +37,45 @@ let originalGetSuperPropertiesBase64: any = null;
 let patchedModule: any = null;
 let observer: MutationObserver | null = null;
 
-// ─── Internal Module Access ───────────────────────────────────────────────────
+// ─── Internal Module Access (for QuestsStore) ─────────────────────────────────
 
-function getInternalModules() {
+function getQuestsStore(): any {
     try {
         const wpChunk = (window as any).webpackChunkdiscord_app;
         if (!wpChunk) return null;
         const wpRequire = wpChunk.push([[Symbol()], {}, (r: any) => r]);
         wpChunk.pop();
         const modules = Object.values(wpRequire.c) as any[];
-        return {
-            QuestsStore: modules.find(x => x?.exports?.Z?.__proto__?.getQuest)?.exports?.Z,
-            api: modules.find(x => x?.exports?.tn?.get)?.exports?.tn,
-        };
-    } catch (e) {
-        console.error("[MobileSpoof] Failed to access internal modules:", e);
+        // Try multiple selector patterns since Discord's minified names change
+        return (
+            modules.find(x => x?.exports?.Z?.__proto__?.getQuest)?.exports?.Z ??
+            modules.find(x => x?.exports?.default?.__proto__?.getQuest)?.exports?.default ??
+            null
+        );
+    } catch {
         return null;
     }
 }
 
-// ─── Mobile Super-Properties Header ─────────────────────────────────────────
+// ─── Quest Enrollment via Internal REST API ───────────────────────────────────
 
-function getMobileSuperPropertiesBase64(): string {
-    const isIOS = settings.store.mobilePlatform === "iOS";
-    const props = isIOS ? {
-        os: "iOS",
-        browser: "Discord iOS",
-        device: "iPhone14,2",
-        system_locale: "en-US",
-        client_version: "337.0",
-        release_channel: "stable",
-        os_version: "17.5",
-        client_build_number: 337000,
-        client_event_source: null
-    } : {
-        os: "Android",
-        browser: "Discord Android",
-        device: "Pixel 8",
-        system_locale: "en-US",
-        client_version: "337.10",
-        release_channel: "googleRelease",
-        os_version: "34",
-        client_build_number: 337010,
-        client_event_source: null
-    };
-    return btoa(unescape(encodeURIComponent(JSON.stringify(props))));
-}
-
-// ─── Quest Enrollment ─────────────────────────────────────────────────────────
-
-async function enrollInQuest(questId: string) {
+async function enrollInQuest(questId: string, questName: string) {
     try {
-        // Enroll directly via fetch with mobile X-Super-Properties
-        // This bypasses the UI's platform check entirely
-        const superProps = getMobileSuperPropertiesBase64();
-        const response = await fetch(`https://discord.com/api/v9/quests/${questId}/enroll`, {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                "X-Super-Properties": superProps,
-                "Authorization": (document.cookie.match(/token=([^;]+)/) || [])[1] || ""
-            }
-        });
+        // Use Discord's own authenticated REST API — no manual auth token needed
+        const res = await RestAPI.post({ url: `/quests/${questId}/enroll` });
 
-        if (response.ok) {
+        if (res?.ok || res?.status === 200) {
             showNotification({
-                title: "Mobile Quest Started!",
-                body: "Successfully enrolled in the mobile quest. Reload Discord to see the updated status.",
+                title: "📱 Mobile Quest Started!",
+                body: `Enrolled in "${questName}". Reload Discord to see the updated status.`,
                 color: "#3ba55c"
             });
+            // Re-inject buttons so this one updates to "Enrolled"
+            setTimeout(addMobileStartButtons, 500);
         } else {
-            const err = await response.json().catch(() => ({}));
             showNotification({
                 title: "Enrollment Failed",
-                body: `Error ${response.status}: ${JSON.stringify(err)}`,
+                body: `Error ${res?.status}: ${JSON.stringify(res?.body ?? {})}`,
                 color: "#ed4245"
             });
         }
@@ -118,48 +88,69 @@ async function enrollInQuest(questId: string) {
     }
 }
 
-// ─── DOM Button Injection ──────────────────────────────────────────────────────
+// ─── DOM Button Injection ─────────────────────────────────────────────────────
 
 function addMobileStartButtons() {
-    const mods = getInternalModules();
-    if (!mods?.QuestsStore) return;
+    const QuestsStore = getQuestsStore();
+    if (!QuestsStore) return;
 
-    const quests = [...(mods.QuestsStore.quests?.values() ?? [])];
+    const quests = [...(QuestsStore.quests?.values() ?? [])];
+
+    // Find quests that don't include platform 1 (Desktop)
+    // 1 = Desktop, 2 = Android, 3 = iOS
     const mobileQuests = quests.filter((q: any) => {
         const platforms: number[] | undefined = q?.config?.platforms;
-        // 1 = Desktop, 2 = Android, 3 = iOS
         return Array.isArray(platforms) && !platforms.includes(1);
     });
 
-    // For each mobile-only quest, find its card in the DOM and inject a button
+    if (mobileQuests.length === 0) return;
+
+    // Try multiple possible class name patterns Discord uses for quest card buttons
+    const containerSelectors = [
+        'div[class*="headingControls"]',
+        'div[class*="contentFooterButtonCont"]',
+        'div[class*="questActions"]',
+        'div[class*="questCard"] div[class*="actions"]',
+        'div[class*="questFooter"]',
+    ];
+
     for (const quest of mobileQuests) {
         const questId: string = quest.id;
-        const questName: string = quest.config?.messages?.questName ?? quest.config?.application?.name ?? "Mobile Quest";
+        const questName: string =
+            quest.config?.messages?.questName ??
+            quest.config?.application?.name ??
+            "Mobile Quest";
         const isEnrolled = !!quest.userStatus?.enrolledAt;
 
-        // Look for existing spoof buttons to avoid duplicates
-        if (document.querySelector(`#mobile-spoof-btn-${questId}`)) continue;
+        if (document.querySelector(`#ms-btn-${questId}`)) continue;
 
-        // Find the quest heading controls or any quest card container
-        const headingControls = document.querySelectorAll('div[class*="headingControls"]');
-        const footers = document.querySelectorAll('div[class*="contentFooterButtonCont"]');
+        for (const selector of containerSelectors) {
+            const containers = document.querySelectorAll(selector);
+            if (containers.length === 0) continue;
 
-        const containers = [...headingControls, ...footers];
-        for (const container of containers) {
-            if (document.querySelector(`#mobile-spoof-btn-${questId}`)) break;
+            for (const container of containers) {
+                if (document.querySelector(`#ms-btn-${questId}`)) break;
 
-            const btn = document.createElement("button");
-            btn.id = `mobile-spoof-btn-${questId}`;
-            btn.className = container.querySelector("button")?.className ?? "vc-mobile-start-btn";
-            btn.style.cssText = "border: 1px solid #5865f2; margin-left: 8px;";
-            btn.innerText = isEnrolled ? "📱 Enrolled" : "📱 Start Mobile";
-            btn.title = `Force-enroll in "${questName}" as a mobile user`;
+                const btn = document.createElement("button");
+                btn.id = `ms-btn-${questId}`;
 
-            if (!isEnrolled) {
-                btn.addEventListener("click", () => enrollInQuest(questId));
+                // Copy styling from an existing button so it blends in
+                const existingBtn = container.querySelector("button");
+                btn.className = existingBtn?.className ?? "";
+                btn.style.cssText = "border: 1px solid #5865f2 !important; margin-left: 8px; cursor: pointer;";
+                btn.innerText = isEnrolled ? "📱 Enrolled" : "📱 Start Mobile";
+                btn.title = `Force-enroll in "${questName}" using mobile spoof`;
+
+                if (!isEnrolled) {
+                    btn.addEventListener("click", e => {
+                        e.stopPropagation();
+                        enrollInQuest(questId, questName);
+                    });
+                }
+
+                container.appendChild(btn);
             }
-
-            container.insertBefore(btn, container.firstChild);
+            break; // Only use first selector that finds containers
         }
     }
 }
@@ -197,7 +188,7 @@ export default definePlugin({
             return originalWsSend!.call(this, data);
         };
 
-        // ── 2. Patch internal getSuperProperties so all REST calls use mobile ─
+        // ── 2. Patch getSuperProperties so all REST calls look mobile ─────────
         waitFor(["getSuperProperties", "getSuperPropertiesBase64"], mod => {
             if (!originalWsSend) return;
             patchedModule = mod;
@@ -222,13 +213,16 @@ export default definePlugin({
             };
         });
 
-        // ── 3. MutationObserver — inject "Start Mobile" button on quest page ──
+        // ── 3. MutationObserver — inject "📱 Start Mobile" button ────────────
+        // No title check — works regardless of language (Dutch/English/etc.)
+        // Deduplication by button ID prevents spamming
         observer = new MutationObserver(() => {
-            if (document.title.toLowerCase().includes("quest")) {
-                addMobileStartButtons();
-            }
+            addMobileStartButtons();
         });
         observer.observe(document.body, { childList: true, subtree: true });
+
+        // Also try immediately in case quest page is already open
+        setTimeout(addMobileStartButtons, 2000);
     },
 
     stop() {
@@ -251,7 +245,6 @@ export default definePlugin({
             observer.disconnect();
             observer = null;
         }
-        // Clean up injected buttons
-        document.querySelectorAll("[id^='mobile-spoof-btn-']").forEach(el => el.remove());
+        document.querySelectorAll("[id^='ms-btn-']").forEach(el => el.remove());
     }
 });
