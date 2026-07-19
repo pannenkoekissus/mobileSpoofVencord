@@ -68,7 +68,7 @@ function patchSuperPropsBase64(existingBase64: string): string {
  * We intentionally do NOT touch other Discord API calls.
  */
 function isQuestUrl(url: string): boolean {
-    return url.includes("/drops") || url.includes("/quests");
+    return url.includes("/drops/") || url.includes("/quests/");
 }
 
 function isDiscordApiUrl(url: string): boolean {
