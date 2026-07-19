@@ -26,8 +26,10 @@ const settings = definePluginSettings({
 // ─── State ────────────────────────────────────────────────────────────────────
 
 let originalWsSend: typeof WebSocket.prototype.send | null = null;
-let originalGetSuperProperties: any = null;
-let superPropsMod: any = null;
+let originalFetch: typeof window.fetch | null = null;
+let originalXhrOpen: typeof XMLHttpRequest.prototype.open | null = null;
+let originalXhrSetHeader: typeof XMLHttpRequest.prototype.setRequestHeader | null = null;
+let platformMod: any = null;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -38,6 +40,59 @@ function getPlatformInfo() {
         browser: isIOS ? "Discord iOS" : "Discord Android",
         device: isIOS ? "Discord iOS" : "Discord Android"
     };
+}
+
+/**
+ * Build a fully valid mobile X-Super-Properties value.
+ */
+function patchSuperPropsBase64(existingBase64: string): string {
+    const isIOS = settings.store.mobilePlatform === "iOS";
+    try {
+        const decoded = JSON.parse(decodeURIComponent(escape(atob(existingBase64))));
+        const system_locale = decoded.system_locale || "en-US";
+        
+        const mobileProps = isIOS ? {
+            os: "iOS",
+            browser: "Discord iOS",
+            device: "iPhone14,2",
+            system_locale,
+            client_version: "337.0",
+            release_channel: "stable",
+            os_version: "17.5",
+            client_build_number: 337000,
+            client_event_source: null
+        } : {
+            os: "Android",
+            browser: "Discord Android",
+            device: "Pixel 8",
+            system_locale,
+            client_version: "337.10",
+            release_channel: "googleRelease",
+            os_version: "34",
+            client_build_number: 337010,
+            client_event_source: null
+        };
+        
+        return btoa(unescape(encodeURIComponent(JSON.stringify(mobileProps))));
+    } catch {
+        return existingBase64;
+    }
+}
+
+function isQuestUrl(url: string): boolean {
+    return url.includes("/quests") || url.includes("/drops");
+}
+
+function isDiscordApiUrl(url: string): boolean {
+    return (
+        url.startsWith("/api/") ||
+        url.startsWith("https://discord.com/api/") ||
+        url.startsWith("https://canary.discord.com/api/") ||
+        url.startsWith("https://ptb.discord.com/api/") ||
+        url.startsWith("https://discordapp.com/api/") ||
+        url.includes("discord.com/api") ||
+        url.includes("discordapp.com/api")
+    );
 }
 
 // ─── Plugin ───────────────────────────────────────────────────────────────────
@@ -51,7 +106,7 @@ export default definePlugin({
     startAt: StartAt.Init,
 
     start() {
-        // ── 1. WebSocket.send — patch Gateway IDENTIFY (op 2) ────────────────
+        // ── 1. WebSocket.send — patch Gateway IDENTIFY ────────────────────────
         originalWsSend = WebSocket.prototype.send;
         WebSocket.prototype.send = function (this: WebSocket, data: any) {
             if (typeof data === "string") {
@@ -73,41 +128,61 @@ export default definePlugin({
             return originalWsSend!.call(this, data);
         };
 
-        // ── 2. Webpack — Patch Internal Properties for React UI & API ────────
-        superPropsMod = findByProps("getSuperProperties");
-        if (superPropsMod && typeof superPropsMod.getSuperProperties === "function") {
-            originalGetSuperProperties = superPropsMod.getSuperProperties;
-            
-            // We completely overwrite the internal properties to trick the React UI 
-            // into believing we are on a mobile device, which enables the "Accept Quest" button.
-            // This also automatically handles the X-Super-Properties for all API requests!
-            superPropsMod.getSuperProperties = function () {
-                const isIOS = settings.store.mobilePlatform === "iOS";
-                const system_locale = "en-US";
-                
-                return isIOS ? {
-                    os: "iOS",
-                    browser: "Discord iOS",
-                    device: "iPhone14,2",
-                    system_locale,
-                    client_version: "337.0",
-                    release_channel: "stable",
-                    os_version: "17.5",
-                    client_build_number: 337000,
-                    client_event_source: null
-                } : {
-                    os: "Android",
-                    browser: "Discord Android",
-                    device: "Pixel 8",
-                    system_locale,
-                    client_version: "337.10",
-                    release_channel: "googleRelease",
-                    os_version: "34",
-                    client_build_number: 337010,
-                    client_event_source: null
-                };
-            };
+        // ── 2. Webpack — Patch UI Platform Flags ──────────────────────────────
+        platformMod = findByProps("isMobile", "isDesktop");
+        if (platformMod) {
+            try {
+                Object.defineProperty(platformMod, "isMobile", { get: () => true, configurable: true });
+                Object.defineProperty(platformMod, "isDesktop", { get: () => false, configurable: true });
+            } catch { /* ignore if frozen */ }
         }
+
+        // ── 3. window.fetch — patch headers on quest endpoints ────────────────
+        originalFetch = window.fetch;
+        window.fetch = function (input: RequestInfo | URL, init?: RequestInit) {
+            try {
+                const url = input instanceof Request ? input.url : input instanceof URL ? input.href : String(input);
+
+                if (!isDiscordApiUrl(url) || !isQuestUrl(url)) {
+                    return originalFetch!.call(this, input, init);
+                }
+
+                const headers = new Headers(input instanceof Request ? input.headers : (init?.headers ?? {}));
+                const existingProps = headers.get("X-Super-Properties");
+                if (existingProps) {
+                    headers.set("X-Super-Properties", patchSuperPropsBase64(existingProps));
+                }
+
+                if (input instanceof Request) {
+                    return originalFetch!.call(this, new Request(input, { ...init, headers }));
+                }
+                return originalFetch!.call(this, input, { ...init, headers });
+            } catch (e) {
+                return originalFetch!.call(this, input, init);
+            }
+        } as typeof window.fetch;
+
+        // ── 4. XMLHttpRequest — patch headers on quest endpoints ──────────────
+        originalXhrOpen = XMLHttpRequest.prototype.open;
+        originalXhrSetHeader = XMLHttpRequest.prototype.setRequestHeader;
+
+        const xhrUrlMap = new WeakMap<XMLHttpRequest, string>();
+
+        XMLHttpRequest.prototype.open = function (this: XMLHttpRequest, method: string, url: string | URL, ...rest: any[]) {
+            const urlStr = String(url);
+            xhrUrlMap.set(this, urlStr);
+            return (originalXhrOpen as any).call(this, method, url, ...rest);
+        };
+
+        XMLHttpRequest.prototype.setRequestHeader = function (this: XMLHttpRequest, name: string, value: string) {
+            const url = xhrUrlMap.get(this) ?? "";
+            if (isDiscordApiUrl(url) && isQuestUrl(url)) {
+                if (name.toLowerCase() === "x-super-properties") {
+                    value = patchSuperPropsBase64(value);
+                }
+            }
+            return originalXhrSetHeader!.call(this, name, value);
+        };
     },
 
     stop() {
@@ -115,11 +190,24 @@ export default definePlugin({
             WebSocket.prototype.send = originalWsSend;
             originalWsSend = null;
         }
-        
-        if (superPropsMod && originalGetSuperProperties) {
-            superPropsMod.getSuperProperties = originalGetSuperProperties;
-            originalGetSuperProperties = null;
-            superPropsMod = null;
+        if (originalFetch) {
+            window.fetch = originalFetch;
+            originalFetch = null;
+        }
+        if (originalXhrOpen) {
+            XMLHttpRequest.prototype.open = originalXhrOpen;
+            originalXhrOpen = null;
+        }
+        if (originalXhrSetHeader) {
+            XMLHttpRequest.prototype.setRequestHeader = originalXhrSetHeader;
+            originalXhrSetHeader = null;
+        }
+        if (platformMod) {
+            try {
+                Object.defineProperty(platformMod, "isMobile", { get: () => false, configurable: true });
+                Object.defineProperty(platformMod, "isDesktop", { get: () => true, configurable: true });
+            } catch { /* ignore */ }
+            platformMod = null;
         }
     }
 });
