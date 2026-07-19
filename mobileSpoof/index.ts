@@ -5,8 +5,10 @@
  */
 
 import { definePluginSettings } from "@api/Settings";
+import { showNotification } from "@api/Notifications";
 import { Devs } from "@utils/constants";
 import definePlugin, { OptionType, StartAt } from "@utils/types";
+import { waitFor } from "@webpack";
 
 // ─── Settings ────────────────────────────────────────────────────────────────
 
@@ -25,95 +27,141 @@ const settings = definePluginSettings({
 // ─── State ────────────────────────────────────────────────────────────────────
 
 let originalWsSend: typeof WebSocket.prototype.send | null = null;
-let originalFetch: typeof window.fetch | null = null;
-let originalXhrOpen: typeof XMLHttpRequest.prototype.open | null = null;
-let originalXhrSend: typeof XMLHttpRequest.prototype.send | null = null;
-let originalXhrSetHeader: typeof XMLHttpRequest.prototype.setRequestHeader | null = null;
+let originalGetSuperProperties: any = null;
+let originalGetSuperPropertiesBase64: any = null;
+let patchedModule: any = null;
+let observer: MutationObserver | null = null;
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─── Internal Module Access ───────────────────────────────────────────────────
 
-function getPlatformInfo() {
-    const isIOS = settings.store.mobilePlatform === "iOS";
-    return {
-        os: isIOS ? "iOS" : "Android",
-        browser: isIOS ? "Discord iOS" : "Discord Android",
-        device: isIOS ? "Discord iOS" : "Discord Android"
-    };
-}
-
-/**
- * Build a fully valid mobile X-Super-Properties value.
- */
-function patchSuperPropsBase64(existingBase64: string): string {
-    const isIOS = settings.store.mobilePlatform === "iOS";
+function getInternalModules() {
     try {
-        const decoded = JSON.parse(decodeURIComponent(escape(atob(existingBase64))));
-        const system_locale = decoded.system_locale || "en-US";
-
-        const mobileProps = isIOS ? {
-            os: "iOS",
-            browser: "Discord iOS",
-            device: "iPhone14,2",
-            system_locale,
-            client_version: "337.0",
-            release_channel: "stable",
-            os_version: "17.5",
-            client_build_number: 337000,
-            client_event_source: null
-        } : {
-            os: "Android",
-            browser: "Discord Android",
-            device: "Pixel 8",
-            system_locale,
-            client_version: "337.10",
-            release_channel: "googleRelease",
-            os_version: "34",
-            client_build_number: 337010,
-            client_event_source: null
+        const wpChunk = (window as any).webpackChunkdiscord_app;
+        if (!wpChunk) return null;
+        const wpRequire = wpChunk.push([[Symbol()], {}, (r: any) => r]);
+        wpChunk.pop();
+        const modules = Object.values(wpRequire.c) as any[];
+        return {
+            QuestsStore: modules.find(x => x?.exports?.Z?.__proto__?.getQuest)?.exports?.Z,
+            api: modules.find(x => x?.exports?.tn?.get)?.exports?.tn,
         };
-
-        return btoa(unescape(encodeURIComponent(JSON.stringify(mobileProps))));
-    } catch {
-        return existingBase64;
+    } catch (e) {
+        console.error("[MobileSpoof] Failed to access internal modules:", e);
+        return null;
     }
 }
 
-/**
- * Inject platform 1 (Desktop) into every quest so the UI shows
- * "Accept Quest" instead of a QR code for mobile-only quests.
- */
-function patchQuestPlatforms(data: any): { data: any; modified: boolean; } {
-    let modified = false;
-    if (Array.isArray(data)) {
-        for (const quest of data) {
-            const platforms = quest?.config?.platforms;
-            if (Array.isArray(platforms) && !platforms.includes(1)) {
-                platforms.push(1);
-                modified = true;
+// ─── Mobile Super-Properties Header ─────────────────────────────────────────
+
+function getMobileSuperPropertiesBase64(): string {
+    const isIOS = settings.store.mobilePlatform === "iOS";
+    const props = isIOS ? {
+        os: "iOS",
+        browser: "Discord iOS",
+        device: "iPhone14,2",
+        system_locale: "en-US",
+        client_version: "337.0",
+        release_channel: "stable",
+        os_version: "17.5",
+        client_build_number: 337000,
+        client_event_source: null
+    } : {
+        os: "Android",
+        browser: "Discord Android",
+        device: "Pixel 8",
+        system_locale: "en-US",
+        client_version: "337.10",
+        release_channel: "googleRelease",
+        os_version: "34",
+        client_build_number: 337010,
+        client_event_source: null
+    };
+    return btoa(unescape(encodeURIComponent(JSON.stringify(props))));
+}
+
+// ─── Quest Enrollment ─────────────────────────────────────────────────────────
+
+async function enrollInQuest(questId: string) {
+    try {
+        // Enroll directly via fetch with mobile X-Super-Properties
+        // This bypasses the UI's platform check entirely
+        const superProps = getMobileSuperPropertiesBase64();
+        const response = await fetch(`https://discord.com/api/v9/quests/${questId}/enroll`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "X-Super-Properties": superProps,
+                "Authorization": (document.cookie.match(/token=([^;]+)/) || [])[1] || ""
             }
+        });
+
+        if (response.ok) {
+            showNotification({
+                title: "Mobile Quest Started!",
+                body: "Successfully enrolled in the mobile quest. Reload Discord to see the updated status.",
+                color: "#3ba55c"
+            });
+        } else {
+            const err = await response.json().catch(() => ({}));
+            showNotification({
+                title: "Enrollment Failed",
+                body: `Error ${response.status}: ${JSON.stringify(err)}`,
+                color: "#ed4245"
+            });
+        }
+    } catch (e: any) {
+        showNotification({
+            title: "Enrollment Error",
+            body: String(e?.message ?? e),
+            color: "#ed4245"
+        });
+    }
+}
+
+// ─── DOM Button Injection ──────────────────────────────────────────────────────
+
+function addMobileStartButtons() {
+    const mods = getInternalModules();
+    if (!mods?.QuestsStore) return;
+
+    const quests = [...(mods.QuestsStore.quests?.values() ?? [])];
+    const mobileQuests = quests.filter((q: any) => {
+        const platforms: number[] | undefined = q?.config?.platforms;
+        // 1 = Desktop, 2 = Android, 3 = iOS
+        return Array.isArray(platforms) && !platforms.includes(1);
+    });
+
+    // For each mobile-only quest, find its card in the DOM and inject a button
+    for (const quest of mobileQuests) {
+        const questId: string = quest.id;
+        const questName: string = quest.config?.messages?.questName ?? quest.config?.application?.name ?? "Mobile Quest";
+        const isEnrolled = !!quest.userStatus?.enrolledAt;
+
+        // Look for existing spoof buttons to avoid duplicates
+        if (document.querySelector(`#mobile-spoof-btn-${questId}`)) continue;
+
+        // Find the quest heading controls or any quest card container
+        const headingControls = document.querySelectorAll('div[class*="headingControls"]');
+        const footers = document.querySelectorAll('div[class*="contentFooterButtonCont"]');
+
+        const containers = [...headingControls, ...footers];
+        for (const container of containers) {
+            if (document.querySelector(`#mobile-spoof-btn-${questId}`)) break;
+
+            const btn = document.createElement("button");
+            btn.id = `mobile-spoof-btn-${questId}`;
+            btn.className = container.querySelector("button")?.className ?? "vc-mobile-start-btn";
+            btn.style.cssText = "border: 1px solid #5865f2; margin-left: 8px;";
+            btn.innerText = isEnrolled ? "📱 Enrolled" : "📱 Start Mobile";
+            btn.title = `Force-enroll in "${questName}" as a mobile user`;
+
+            if (!isEnrolled) {
+                btn.addEventListener("click", () => enrollInQuest(questId));
+            }
+
+            container.insertBefore(btn, container.firstChild);
         }
     }
-    return { data, modified };
-}
-
-function isQuestUrl(url: string): boolean {
-    return url.includes("/quests") || url.includes("/drops");
-}
-
-function isQuestListUrl(url: string): boolean {
-    return url.includes("/users/@me/quests");
-}
-
-function isDiscordApiUrl(url: string): boolean {
-    return (
-        url.startsWith("/api/") ||
-        url.startsWith("https://discord.com/api/") ||
-        url.startsWith("https://canary.discord.com/api/") ||
-        url.startsWith("https://ptb.discord.com/api/") ||
-        url.startsWith("https://discordapp.com/api/") ||
-        url.includes("discord.com/api") ||
-        url.includes("discordapp.com/api")
-    );
 }
 
 // ─── Plugin ───────────────────────────────────────────────────────────────────
@@ -127,7 +175,7 @@ export default definePlugin({
     startAt: StartAt.Init,
 
     start() {
-        // ── 1. WebSocket.send — patch Gateway IDENTIFY ────────────────────────
+        // ── 1. WebSocket.send — patch Gateway IDENTIFY (mobile status dot) ────
         originalWsSend = WebSocket.prototype.send;
         WebSocket.prototype.send = function (this: WebSocket, data: any) {
             if (typeof data === "string") {
@@ -137,10 +185,10 @@ export default definePlugin({
                     if (isGateway) {
                         const parsed = JSON.parse(data);
                         if (parsed.op === 2 && parsed.d?.properties) {
-                            const { os, browser, device } = getPlatformInfo();
-                            parsed.d.properties.$os = os;
-                            parsed.d.properties.$browser = browser;
-                            parsed.d.properties.$device = device;
+                            const isIOS = settings.store.mobilePlatform === "iOS";
+                            parsed.d.properties.$os = isIOS ? "iOS" : "Android";
+                            parsed.d.properties.$browser = isIOS ? "Discord iOS" : "Discord Android";
+                            parsed.d.properties.$device = isIOS ? "Discord iOS" : "Discord Android";
                             data = JSON.stringify(parsed);
                         }
                     }
@@ -149,98 +197,61 @@ export default definePlugin({
             return originalWsSend!.call(this, data);
         };
 
-        // ── 2. window.fetch — patch headers on quest requests & inject Desktop
-        //       platform into quest list responses so UI shows Accept button ───
-        originalFetch = window.fetch;
-        window.fetch = async function (input: RequestInfo | URL, init?: RequestInit) {
-            try {
-                const urlStr = input instanceof Request ? input.url : input instanceof URL ? input.href : String(input);
+        // ── 2. Patch internal getSuperProperties so all REST calls use mobile ─
+        waitFor(["getSuperProperties", "getSuperPropertiesBase64"], mod => {
+            if (!originalWsSend) return;
+            patchedModule = mod;
+            originalGetSuperProperties = mod.getSuperProperties;
+            originalGetSuperPropertiesBase64 = mod.getSuperPropertiesBase64;
 
-                if (!isDiscordApiUrl(urlStr) || !isQuestUrl(urlStr)) {
-                    return originalFetch!.call(this, input, init);
-                }
+            mod.getSuperProperties = function () {
+                const props = originalGetSuperProperties.apply(this, arguments);
+                const isIOS = settings.store.mobilePlatform === "iOS";
+                props.os = isIOS ? "iOS" : "Android";
+                props.browser = isIOS ? "Discord iOS" : "Discord Android";
+                props.device = isIOS ? "Discord iOS" : "Discord Android";
+                props.client_build_number = isIOS ? 337000 : 337010;
+                props.client_version = isIOS ? "337.0" : "337.10";
+                props.release_channel = isIOS ? "stable" : "googleRelease";
+                return props;
+            };
 
-                // Patch outgoing X-Super-Properties header
-                const headers = new Headers(input instanceof Request ? input.headers : (init?.headers ?? {}));
-                const existingProps = headers.get("X-Super-Properties");
-                if (existingProps) {
-                    headers.set("X-Super-Properties", patchSuperPropsBase64(existingProps));
-                }
+            mod.getSuperPropertiesBase64 = function () {
+                const props = mod.getSuperProperties.apply(this, arguments);
+                return btoa(unescape(encodeURIComponent(JSON.stringify(props))));
+            };
+        });
 
-                const patchedRequest = input instanceof Request
-                    ? new Request(input, { ...init, headers })
-                    : [urlStr, { ...init, headers }] as const;
-
-                const response = await (Array.isArray(patchedRequest)
-                    ? originalFetch!.call(this, patchedRequest[0], patchedRequest[1])
-                    : originalFetch!.call(this, patchedRequest));
-
-                // Intercept quest list response to inject Desktop platform
-                if (isQuestListUrl(urlStr) && response.ok) {
-                    try {
-                        const json = await response.clone().json();
-                        const { data, modified } = patchQuestPlatforms(json);
-                        if (modified) {
-                            return new Response(JSON.stringify(data), {
-                                status: response.status,
-                                statusText: response.statusText,
-                                headers: response.headers
-                            });
-                        }
-                    } catch { /* fallback to original response */ }
-                }
-
-                return response;
-            } catch (e) {
-                return originalFetch!.call(this, input, init);
+        // ── 3. MutationObserver — inject "Start Mobile" button on quest page ──
+        observer = new MutationObserver(() => {
+            if (document.title.toLowerCase().includes("quest")) {
+                addMobileStartButtons();
             }
-        } as typeof window.fetch;
-
-        // ── 3. XMLHttpRequest — patch headers & inject Desktop platform ───────
-        originalXhrOpen = XMLHttpRequest.prototype.open;
-        originalXhrSend = XMLHttpRequest.prototype.send;
-        originalXhrSetHeader = XMLHttpRequest.prototype.setRequestHeader;
-
-        const xhrUrlMap = new WeakMap<XMLHttpRequest, string>();
-
-        XMLHttpRequest.prototype.open = function (this: XMLHttpRequest, method: string, url: string | URL, ...rest: any[]) {
-            xhrUrlMap.set(this, String(url));
-            return (originalXhrOpen as any).call(this, method, url, ...rest);
-        };
-
-        XMLHttpRequest.prototype.setRequestHeader = function (this: XMLHttpRequest, name: string, value: string) {
-            const url = xhrUrlMap.get(this) ?? "";
-            if (isDiscordApiUrl(url) && isQuestUrl(url) && name.toLowerCase() === "x-super-properties") {
-                value = patchSuperPropsBase64(value);
-            }
-            return originalXhrSetHeader!.call(this, name, value);
-        };
-
-        XMLHttpRequest.prototype.send = function (this: XMLHttpRequest, body?: Document | XMLHttpRequestBodyInit | null) {
-            const url = xhrUrlMap.get(this) ?? "";
-            if (isDiscordApiUrl(url) && isQuestListUrl(url)) {
-                this.addEventListener("readystatechange", function () {
-                    if (this.readyState !== 4) return;
-                    try {
-                        const json = JSON.parse(this.responseText);
-                        const { data, modified } = patchQuestPlatforms(json);
-                        if (modified) {
-                            const patched = JSON.stringify(data);
-                            Object.defineProperty(this, "responseText", { get: () => patched, configurable: true });
-                            Object.defineProperty(this, "response", { get: () => patched, configurable: true });
-                        }
-                    } catch { /* ignore */ }
-                });
-            }
-            return (originalXhrSend as any).call(this, body);
-        };
+        });
+        observer.observe(document.body, { childList: true, subtree: true });
     },
 
     stop() {
-        if (originalWsSend) { WebSocket.prototype.send = originalWsSend; originalWsSend = null; }
-        if (originalFetch) { window.fetch = originalFetch; originalFetch = null; }
-        if (originalXhrOpen) { XMLHttpRequest.prototype.open = originalXhrOpen; originalXhrOpen = null; }
-        if (originalXhrSend) { XMLHttpRequest.prototype.send = originalXhrSend; originalXhrSend = null; }
-        if (originalXhrSetHeader) { XMLHttpRequest.prototype.setRequestHeader = originalXhrSetHeader; originalXhrSetHeader = null; }
+        if (originalWsSend) {
+            WebSocket.prototype.send = originalWsSend;
+            originalWsSend = null;
+        }
+        if (patchedModule) {
+            if (originalGetSuperProperties) {
+                patchedModule.getSuperProperties = originalGetSuperProperties;
+                originalGetSuperProperties = null;
+            }
+            if (originalGetSuperPropertiesBase64) {
+                patchedModule.getSuperPropertiesBase64 = originalGetSuperPropertiesBase64;
+                originalGetSuperPropertiesBase64 = null;
+            }
+            patchedModule = null;
+        }
+        if (observer) {
+            observer.disconnect();
+            observer = null;
+        }
+        // Clean up injected buttons
+        document.querySelectorAll("[id^='mobile-spoof-btn-']").forEach(el => el.remove());
     }
 });
