@@ -24,62 +24,60 @@ const settings = definePluginSettings({
     }
 });
 
-// ─── Internal Modules (lazy — available after Discord loads) ──────────────────
+// ─── Internal Modules ─────────────────────────────────────────────────────────
 
-// Discord's authenticated REST API client — handles auth token automatically
 const RestAPI = findByPropsLazy("getAPIBaseURL", "get", "post");
+const QuestsStoreLazy = findByPropsLazy("getQuest", "quests");
 
 // ─── State ────────────────────────────────────────────────────────────────────
 
 let originalWsSend: typeof WebSocket.prototype.send | null = null;
 let originalGetSuperProperties: any = null;
 let originalGetSuperPropertiesBase64: any = null;
+let uiInitTimeout: ReturnType<typeof setTimeout> | null = null;
 let patchedModule: any = null;
 let observer: MutationObserver | null = null;
+let floatingContainer: HTMLDivElement | null = null;
 
-// ─── Internal Module Access (for QuestsStore) ─────────────────────────────────
+// ─── QuestsStore Access ───────────────────────────────────────────────────────
 
 function getQuestsStore(): any {
     try {
-        const wpChunk = (window as any).webpackChunkdiscord_app;
-        if (!wpChunk) return null;
-        const wpRequire = wpChunk.push([[Symbol()], {}, (r: any) => r]);
-        wpChunk.pop();
-        const modules = Object.values(wpRequire.c) as any[];
-        // Try multiple selector patterns since Discord's minified names change
-        return (
-            modules.find(x => x?.exports?.Z?.__proto__?.getQuest)?.exports?.Z ??
-            modules.find(x => x?.exports?.default?.__proto__?.getQuest)?.exports?.default ??
-            null
-        );
-    } catch {
+        // QuestsStoreLazy is resolved by Vencord's webpack finder at runtime
+        const store = QuestsStoreLazy as any;
+        if (store && store.quests) return store;
+        console.log("[MobileSpoof] QuestsStore not yet ready");
+        return null;
+    } catch (e) {
+        console.error("[MobileSpoof] getQuestsStore error:", e);
         return null;
     }
 }
 
-// ─── Quest Enrollment via Internal REST API ───────────────────────────────────
+// ─── Quest Enrollment ─────────────────────────────────────────────────────────
 
 async function enrollInQuest(questId: string, questName: string) {
     try {
-        // Use Discord's own authenticated REST API — no manual auth token needed
+        console.log("[MobileSpoof] Enrolling in quest:", questId, questName);
         const res = await RestAPI.post({ url: `/quests/${questId}/enroll` });
+        console.log("[MobileSpoof] Enroll response:", res?.status, res?.body);
 
-        if (res?.ok || res?.status === 200) {
+        if (res?.ok || res?.status === 200 || res?.status === 201) {
             showNotification({
                 title: "📱 Mobile Quest Started!",
-                body: `Enrolled in "${questName}". Reload Discord to see the updated status.`,
+                body: `Enrolled in "${questName}". Reload Discord to see updated status.`,
                 color: "#3ba55c"
             });
-            // Re-inject buttons so this one updates to "Enrolled"
-            setTimeout(addMobileStartButtons, 500);
+            updateFloatingUI();
         } else {
             showNotification({
                 title: "Enrollment Failed",
-                body: `Error ${res?.status}: ${JSON.stringify(res?.body ?? {})}`,
+                body: `Status ${res?.status}: ${JSON.stringify(res?.body ?? {})}`,
                 color: "#ed4245"
             });
         }
     } catch (e: any) {
+        console.error("[MobileSpoof] Enroll error:", e);
         showNotification({
             title: "Enrollment Error",
             body: String(e?.message ?? e),
@@ -88,71 +86,113 @@ async function enrollInQuest(questId: string, questName: string) {
     }
 }
 
-// ─── DOM Button Injection ─────────────────────────────────────────────────────
+// ─── Floating UI ──────────────────────────────────────────────────────────────
 
-function addMobileStartButtons() {
-    const QuestsStore = getQuestsStore();
-    if (!QuestsStore) return;
+function updateFloatingUI() {
+    const store = getQuestsStore();
 
-    const quests = [...(QuestsStore.quests?.values() ?? [])];
+    if (!floatingContainer) return;
 
-    // Find quests that don't include platform 1 (Desktop)
-    // 1 = Desktop, 2 = Android, 3 = iOS
-    const mobileQuests = quests.filter((q: any) => {
+    if (!store) {
+        console.log("[MobileSpoof] updateFloatingUI: no store");
+        floatingContainer.style.display = "none";
+        return;
+    }
+
+    const allQuests = [...(store.quests?.values() ?? [])];
+    console.log("[MobileSpoof] All quests:", allQuests.length, allQuests.map((q: any) => ({
+        id: q.id,
+        platforms: q?.config?.platforms,
+        enrolled: !!q?.userStatus?.enrolledAt,
+        completed: !!q?.userStatus?.completedAt,
+        name: q?.config?.messages?.questName ?? q?.config?.application?.name
+    })));
+
+    // Mobile-only = platforms does NOT include 1 (Desktop)
+    const mobileQuests = allQuests.filter((q: any) => {
         const platforms: number[] | undefined = q?.config?.platforms;
         return Array.isArray(platforms) && !platforms.includes(1);
     });
 
-    if (mobileQuests.length === 0) return;
+    console.log("[MobileSpoof] Mobile-only quests:", mobileQuests.length);
 
-    // Try multiple possible class name patterns Discord uses for quest card buttons
-    const containerSelectors = [
-        'div[class*="headingControls"]',
-        'div[class*="contentFooterButtonCont"]',
-        'div[class*="questActions"]',
-        'div[class*="questCard"] div[class*="actions"]',
-        'div[class*="questFooter"]',
-    ];
+    if (mobileQuests.length === 0) {
+        floatingContainer.style.display = "none";
+        return;
+    }
+
+    // Build floating button HTML
+    floatingContainer.innerHTML = "";
+    floatingContainer.style.display = "flex";
 
     for (const quest of mobileQuests) {
         const questId: string = quest.id;
         const questName: string =
             quest.config?.messages?.questName ??
             quest.config?.application?.name ??
-            "Mobile Quest";
+            `Quest ${questId}`;
         const isEnrolled = !!quest.userStatus?.enrolledAt;
+        const isCompleted = !!quest.userStatus?.completedAt;
 
-        if (document.querySelector(`#ms-btn-${questId}`)) continue;
+        const btn = document.createElement("button");
+        btn.style.cssText = `
+            background: ${isCompleted ? "#3ba55c" : isEnrolled ? "#5865f2" : "#ed4245"};
+            color: white;
+            border: none;
+            border-radius: 4px;
+            padding: 8px 12px;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: ${isEnrolled ? "default" : "pointer"};
+            margin: 2px 0;
+            font-family: inherit;
+        `;
+        btn.textContent = isCompleted
+            ? `✅ ${questName}`
+            : isEnrolled
+                ? `📱 ${questName} (enrolled)`
+                : `📱 Start: ${questName}`;
 
-        for (const selector of containerSelectors) {
-            const containers = document.querySelectorAll(selector);
-            if (containers.length === 0) continue;
-
-            for (const container of containers) {
-                if (document.querySelector(`#ms-btn-${questId}`)) break;
-
-                const btn = document.createElement("button");
-                btn.id = `ms-btn-${questId}`;
-
-                // Copy styling from an existing button so it blends in
-                const existingBtn = container.querySelector("button");
-                btn.className = existingBtn?.className ?? "";
-                btn.style.cssText = "border: 1px solid #5865f2 !important; margin-left: 8px; cursor: pointer;";
-                btn.innerText = isEnrolled ? "📱 Enrolled" : "📱 Start Mobile";
-                btn.title = `Force-enroll in "${questName}" using mobile spoof`;
-
-                if (!isEnrolled) {
-                    btn.addEventListener("click", e => {
-                        e.stopPropagation();
-                        enrollInQuest(questId, questName);
-                    });
-                }
-
-                container.appendChild(btn);
-            }
-            break; // Only use first selector that finds containers
+        if (!isEnrolled && !isCompleted) {
+            btn.addEventListener("click", () => enrollInQuest(questId, questName));
         }
+        floatingContainer.appendChild(btn);
     }
+}
+
+function createFloatingUI() {
+    if (floatingContainer) return;
+
+    const wrapper = document.createElement("div");
+    wrapper.id = "vc-mobile-spoof-float";
+    wrapper.style.cssText = `
+        position: fixed;
+        bottom: 60px;
+        right: 16px;
+        z-index: 9999;
+        display: none;
+        flex-direction: column;
+        gap: 4px;
+        pointer-events: all;
+        background: rgba(30,31,34,0.95);
+        border: 1px solid #5865f2;
+        border-radius: 8px;
+        padding: 10px;
+        box-shadow: 0 4px 24px rgba(0,0,0,0.5);
+        min-width: 220px;
+        max-width: 320px;
+    `;
+
+    const label = document.createElement("div");
+    label.style.cssText = "color: #b5bac1; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: 4px; font-family: inherit;";
+    label.textContent = "📱 Mobile Quests";
+    wrapper.appendChild(label);
+
+    floatingContainer = document.createElement("div");
+    floatingContainer.style.cssText = "display: flex; flex-direction: column; gap: 4px;";
+    wrapper.appendChild(floatingContainer);
+
+    document.body.appendChild(wrapper);
 }
 
 // ─── Plugin ───────────────────────────────────────────────────────────────────
@@ -166,7 +206,7 @@ export default definePlugin({
     startAt: StartAt.Init,
 
     start() {
-        // ── 1. WebSocket.send — patch Gateway IDENTIFY (mobile status dot) ────
+        // ── 1. WebSocket — patch Gateway IDENTIFY (mobile status dot) ─────────
         originalWsSend = WebSocket.prototype.send;
         WebSocket.prototype.send = function (this: WebSocket, data: any) {
             if (typeof data === "string") {
@@ -188,7 +228,7 @@ export default definePlugin({
             return originalWsSend!.call(this, data);
         };
 
-        // ── 2. Patch getSuperProperties so all REST calls look mobile ─────────
+        // ── 2. getSuperProperties — patch REST API mobile fingerprint ─────────
         waitFor(["getSuperProperties", "getSuperPropertiesBase64"], mod => {
             if (!originalWsSend) return;
             patchedModule = mod;
@@ -213,38 +253,32 @@ export default definePlugin({
             };
         });
 
-        // ── 3. MutationObserver — inject "📱 Start Mobile" button ────────────
-        // No title check — works regardless of language (Dutch/English/etc.)
-        // Deduplication by button ID prevents spamming
-        observer = new MutationObserver(() => {
-            addMobileStartButtons();
-        });
-        observer.observe(document.body, { childList: true, subtree: true });
+        // ── 3. Floating UI — deferred until document.body exists ─────────────
+        // At StartAt.Init, document.body may be null — poll until it's ready
+        observer = new MutationObserver(() => updateFloatingUI());
 
-        // Also try immediately in case quest page is already open
-        setTimeout(addMobileStartButtons, 2000);
+        const initUI = () => {
+            if (!document.body) {
+                uiInitTimeout = setTimeout(initUI, 100);
+                return;
+            }
+            createFloatingUI();
+            updateFloatingUI();
+            observer!.observe(document.body, { childList: true, subtree: true });
+        };
+        initUI();
     },
 
     stop() {
-        if (originalWsSend) {
-            WebSocket.prototype.send = originalWsSend;
-            originalWsSend = null;
-        }
+        if (uiInitTimeout) { clearTimeout(uiInitTimeout); uiInitTimeout = null; }
+        if (originalWsSend) { WebSocket.prototype.send = originalWsSend; originalWsSend = null; }
         if (patchedModule) {
-            if (originalGetSuperProperties) {
-                patchedModule.getSuperProperties = originalGetSuperProperties;
-                originalGetSuperProperties = null;
-            }
-            if (originalGetSuperPropertiesBase64) {
-                patchedModule.getSuperPropertiesBase64 = originalGetSuperPropertiesBase64;
-                originalGetSuperPropertiesBase64 = null;
-            }
+            if (originalGetSuperProperties) { patchedModule.getSuperProperties = originalGetSuperProperties; originalGetSuperProperties = null; }
+            if (originalGetSuperPropertiesBase64) { patchedModule.getSuperPropertiesBase64 = originalGetSuperPropertiesBase64; originalGetSuperPropertiesBase64 = null; }
             patchedModule = null;
         }
-        if (observer) {
-            observer.disconnect();
-            observer = null;
-        }
-        document.querySelectorAll("[id^='ms-btn-']").forEach(el => el.remove());
+        if (observer) { observer.disconnect(); observer = null; }
+        document.getElementById("vc-mobile-spoof-float")?.remove();
+        floatingContainer = null;
     }
 });
