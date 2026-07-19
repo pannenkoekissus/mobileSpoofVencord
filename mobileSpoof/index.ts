@@ -51,18 +51,38 @@ function getSpoofedUserAgent(os: string): string {
 }
 
 /**
- * Build a mobile X-Super-Properties value, using the existing one as base
- * so we don't break any other fields Discord needs.
+ * Build a fully valid mobile X-Super-Properties value.
+ * We completely replace desktop fields to prevent Discord backend validation errors.
  */
 function patchSuperPropsBase64(existingBase64: string): string {
-    const { os, browser, device } = getPlatformInfo();
+    const isIOS = settings.store.mobilePlatform === "iOS";
     try {
         const decoded = JSON.parse(decodeURIComponent(escape(atob(existingBase64))));
-        // Only change the three client-identity fields — leave everything else intact
-        decoded.os = os;
-        decoded.browser = browser;
-        decoded.device = device;
-        return btoa(unescape(encodeURIComponent(JSON.stringify(decoded))));
+        const system_locale = decoded.system_locale || "en-US";
+        
+        const mobileProps = isIOS ? {
+            os: "iOS",
+            browser: "Discord iOS",
+            device: "iPhone14,2",
+            system_locale,
+            client_version: "212.0",
+            release_channel: "stable",
+            os_version: "17.5",
+            client_build_number: 212000,
+            client_event_source: null
+        } : {
+            os: "Android",
+            browser: "Discord Android",
+            device: "Pixel 8",
+            system_locale,
+            client_version: "212.19 - pn",
+            release_channel: "googleRelease",
+            os_version: "34",
+            client_build_number: 212019,
+            client_event_source: null
+        };
+        
+        return btoa(unescape(encodeURIComponent(JSON.stringify(mobileProps))));
     } catch {
         // If we can't parse, return unchanged
         return existingBase64;
@@ -70,11 +90,19 @@ function patchSuperPropsBase64(existingBase64: string): string {
 }
 
 /**
- * Quest-related endpoints that need mobile headers to count progress.
- * We intentionally do NOT touch other Discord API calls.
+ * All quest-related endpoints that need X-Super-Properties spoofed.
  */
-function isQuestUrl(url: string): boolean {
+function isQuestRelatedUrl(url: string): boolean {
     return url.includes("/quests") || url.includes("/drops");
+}
+
+/**
+ * Specifically quest progress endpoints (enroll/heartbeat).
+ * These need User-Agent spoofing to bypass Discord anti-cheat, 
+ * whereas the quest list endpoint doesn't.
+ */
+function isQuestProgressUrl(url: string): boolean {
+    return url.includes("/quests/") || url.includes("/drops/");
 }
 
 function isDiscordApiUrl(url: string): boolean {
@@ -122,7 +150,7 @@ export default definePlugin({
             return originalWsSend!.call(this, data);
         };
 
-        // ── 2. window.fetch — only patch headers on quest endpoints ──────────
+        // ── 2. window.fetch — patch headers on quest endpoints ──────────
         originalFetch = window.fetch;
         window.fetch = function (input: RequestInfo | URL, init?: RequestInit) {
             try {
@@ -130,7 +158,7 @@ export default definePlugin({
                     : input instanceof URL ? input.href
                         : String(input);
 
-                if (!isDiscordApiUrl(url) || !isQuestUrl(url)) {
+                if (!isDiscordApiUrl(url) || !isQuestRelatedUrl(url)) {
                     return originalFetch!.call(this, input, init);
                 }
 
@@ -144,9 +172,11 @@ export default definePlugin({
                     headers.set("X-Super-Properties", patchSuperPropsBase64(existingProps));
                 }
 
-                // For quest endpoints, also spoof the User-Agent
-                const { os } = getPlatformInfo();
-                headers.set("User-Agent", getSpoofedUserAgent(os));
+                // Only spoof User-Agent for active progress endpoints to avoid Cloudflare 403 on the list fetch
+                if (isQuestProgressUrl(url)) {
+                    const { os } = getPlatformInfo();
+                    headers.set("User-Agent", getSpoofedUserAgent(os));
+                }
 
                 if (input instanceof Request) {
                     return originalFetch!.call(this, new Request(input, { ...init, headers }));
@@ -158,7 +188,7 @@ export default definePlugin({
             }
         } as typeof window.fetch;
 
-        // ── 3. XMLHttpRequest — only patch headers on quest endpoints ────────
+        // ── 3. XMLHttpRequest — patch headers on quest endpoints ────────
         originalXhrOpen = XMLHttpRequest.prototype.open;
         originalXhrSetHeader = XMLHttpRequest.prototype.setRequestHeader;
 
@@ -175,8 +205,8 @@ export default definePlugin({
             
             const res = (originalXhrOpen as any).call(this, method, url, ...rest);
 
-            // Set User-Agent for quest URLs on open
-            if (isDiscordApiUrl(urlStr) && isQuestUrl(urlStr)) {
+            // Set User-Agent for quest progress URLs on open
+            if (isDiscordApiUrl(urlStr) && isQuestProgressUrl(urlStr)) {
                 try {
                     const { os } = getPlatformInfo();
                     originalXhrSetHeader!.call(this, "User-Agent", getSpoofedUserAgent(os));
@@ -192,11 +222,11 @@ export default definePlugin({
             value: string
         ) {
             const url = xhrUrlMap.get(this) ?? "";
-            if (isDiscordApiUrl(url) && isQuestUrl(url)) {
+            if (isDiscordApiUrl(url) && isQuestRelatedUrl(url)) {
                 const lowerName = name.toLowerCase();
                 if (lowerName === "x-super-properties") {
                     value = patchSuperPropsBase64(value);
-                } else if (lowerName === "user-agent") {
+                } else if (lowerName === "user-agent" && isQuestProgressUrl(url)) {
                     const { os } = getPlatformInfo();
                     value = getSpoofedUserAgent(os);
                 }
