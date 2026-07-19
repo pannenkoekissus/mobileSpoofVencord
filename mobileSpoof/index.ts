@@ -8,7 +8,8 @@ import { showNotification } from "@api/Notifications";
 import { definePluginSettings } from "@api/Settings";
 import { Devs } from "@utils/constants";
 import definePlugin, { OptionType, StartAt } from "@utils/types";
-import { findByPropsLazy, waitFor } from "@webpack";
+import { waitFor } from "@webpack";
+import { RestAPI } from "@webpack/common";
 
 // ─── Settings ────────────────────────────────────────────────────────────────
 
@@ -24,11 +25,6 @@ const settings = definePluginSettings({
     }
 });
 
-// ─── Internal Modules ─────────────────────────────────────────────────────────
-
-const RestAPI = findByPropsLazy("getAPIBaseURL", "get", "post");
-const QuestsStoreLazy = findByPropsLazy("getQuest", "quests");
-
 // ─── State ────────────────────────────────────────────────────────────────────
 
 let originalWsSend: typeof WebSocket.prototype.send | null = null;
@@ -38,21 +34,11 @@ let uiInitTimeout: ReturnType<typeof setTimeout> | null = null;
 let patchedModule: any = null;
 let observer: MutationObserver | null = null;
 let floatingContainer: HTMLDivElement | null = null;
+let observerThrottle: ReturnType<typeof setTimeout> | null = null;
+let QuestsStore: any = null;
 
-// ─── QuestsStore Access ───────────────────────────────────────────────────────
-
-function getQuestsStore(): any {
-    try {
-        // QuestsStoreLazy is resolved by Vencord's webpack finder at runtime
-        const store = QuestsStoreLazy as any;
-        if (store && store.quests) return store;
-        console.log("[MobileSpoof] QuestsStore not yet ready");
-        return null;
-    } catch (e) {
-        console.error("[MobileSpoof] getQuestsStore error:", e);
-        return null;
-    }
-}
+// Task types that require a mobile device
+const MOBILE_TASK_TYPES = ["WATCH_VIDEO_ON_MOBILE", "PLAY_ON_MOBILE", "STREAM_ON_MOBILE", "COMPLETE_ON_MOBILE"];
 
 // ─── Quest Enrollment ─────────────────────────────────────────────────────────
 
@@ -65,7 +51,7 @@ async function enrollInQuest(questId: string, questName: string) {
         if (res?.ok || res?.status === 200 || res?.status === 201) {
             showNotification({
                 title: "📱 Mobile Quest Started!",
-                body: `Enrolled in "${questName}". Reload Discord to see updated status.`,
+                body: `Enrolled in "${questName}".`,
                 color: "#3ba55c"
             });
             updateFloatingUI();
@@ -89,41 +75,37 @@ async function enrollInQuest(questId: string, questName: string) {
 // ─── Floating UI ──────────────────────────────────────────────────────────────
 
 function updateFloatingUI() {
-    const store = getQuestsStore();
-
     if (!floatingContainer) return;
+    const wrapper = document.getElementById("vc-mobile-spoof-float");
 
-    if (!store) {
-        console.log("[MobileSpoof] updateFloatingUI: no store");
-        floatingContainer.style.display = "none";
+    if (!QuestsStore) {
+        if (wrapper) wrapper.style.display = "none";
         return;
     }
 
-    const allQuests = [...(store.quests?.values() ?? [])];
-    console.log("[MobileSpoof] All quests:", allQuests.length, allQuests.map((q: any) => ({
-        id: q.id,
-        platforms: q?.config?.platforms,
-        enrolled: !!q?.userStatus?.enrolledAt,
-        completed: !!q?.userStatus?.completedAt,
-        name: q?.config?.messages?.questName ?? q?.config?.application?.name
-    })));
+    const allQuests = [...(QuestsStore.quests?.values() ?? [])];
 
-    // Mobile-only = platforms does NOT include 1 (Desktop)
+    // Detect mobile quests by task type, NOT platforms array.
     const mobileQuests = allQuests.filter((q: any) => {
-        const platforms: number[] | undefined = q?.config?.platforms;
-        return Array.isArray(platforms) && !platforms.includes(1);
+        const taskConfig = q?.config?.taskConfig ?? q?.config?.taskConfigV2;
+        if (!taskConfig?.tasks) return false;
+        const hasMobileTask = MOBILE_TASK_TYPES.some(t => taskConfig.tasks[t] != null);
+        return hasMobileTask;
     });
 
-    console.log("[MobileSpoof] Mobile-only quests:", mobileQuests.length);
+    console.log("[MobileSpoof] Mobile quests found:", mobileQuests.length, "/", allQuests.length);
 
     if (mobileQuests.length === 0) {
-        floatingContainer.style.display = "none";
+        if (wrapper) wrapper.style.display = "none";
         return;
     }
+
+    // Disconnect MutationObserver temporarily during DOM modification to prevent infinite self-triggers
+    if (observer) observer.disconnect();
 
     // Build floating button HTML
     floatingContainer.innerHTML = "";
-    floatingContainer.style.display = "flex";
+    if (wrapper) wrapper.style.display = "flex";
 
     for (const quest of mobileQuests) {
         const questId: string = quest.id;
@@ -136,14 +118,14 @@ function updateFloatingUI() {
 
         const btn = document.createElement("button");
         btn.style.cssText = `
-            background: ${isCompleted ? "#3ba55c" : isEnrolled ? "#5865f2" : "#ed4245"};
+            background: ${isCompleted ? "#23a55a" : isEnrolled ? "#5865f2" : "#ed4245"};
             color: white;
             border: none;
             border-radius: 4px;
             padding: 8px 12px;
             font-size: 13px;
             font-weight: 600;
-            cursor: ${isEnrolled ? "default" : "pointer"};
+            cursor: ${isEnrolled || isCompleted ? "default" : "pointer"};
             margin: 2px 0;
             font-family: inherit;
         `;
@@ -154,9 +136,15 @@ function updateFloatingUI() {
                 : `📱 Start: ${questName}`;
 
         if (!isEnrolled && !isCompleted) {
+            btn.style.cursor = "pointer";
             btn.addEventListener("click", () => enrollInQuest(questId, questName));
         }
         floatingContainer.appendChild(btn);
+    }
+
+    // Re-observe the document body
+    if (observer && document.body) {
+        observer.observe(document.body, { childList: true, subtree: true });
     }
 }
 
@@ -253,9 +241,18 @@ export default definePlugin({
             };
         });
 
-        // ── 3. Floating UI — deferred until document.body exists ─────────────
-        // At StartAt.Init, document.body may be null — poll until it's ready
-        observer = new MutationObserver(() => updateFloatingUI());
+        // ── 3. QuestsStore — wait for load and retrieve ──────────────────────
+        waitFor(["getQuest", "quests"], store => {
+            if (!originalWsSend) return;
+            QuestsStore = store;
+            updateFloatingUI();
+        });
+
+        // ── 4. Floating UI — deferred until document.body exists ─────────────
+        observer = new MutationObserver(() => {
+            if (observerThrottle) clearTimeout(observerThrottle);
+            observerThrottle = setTimeout(() => updateFloatingUI(), 500);
+        });
 
         const initUI = () => {
             if (!document.body) {
@@ -280,5 +277,6 @@ export default definePlugin({
         if (observer) { observer.disconnect(); observer = null; }
         document.getElementById("vc-mobile-spoof-float")?.remove();
         floatingContainer = null;
+        QuestsStore = null;
     }
 });
