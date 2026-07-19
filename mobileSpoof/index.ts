@@ -52,7 +52,8 @@ function getSpoofedUserAgent(os: string): string {
 
 /**
  * Build a fully valid mobile X-Super-Properties value.
- * We completely replace desktop fields to prevent Discord backend validation errors.
+ * We completely replace desktop fields to prevent Discord backend validation errors,
+ * and we use a modern build number to prevent Discord from hiding quests from "outdated" clients.
  */
 function patchSuperPropsBase64(existingBase64: string): string {
     const isIOS = settings.store.mobilePlatform === "iOS";
@@ -65,20 +66,20 @@ function patchSuperPropsBase64(existingBase64: string): string {
             browser: "Discord iOS",
             device: "iPhone14,2",
             system_locale,
-            client_version: "212.0",
+            client_version: "337.0",
             release_channel: "stable",
             os_version: "17.5",
-            client_build_number: 212000,
+            client_build_number: 337000,
             client_event_source: null
         } : {
             os: "Android",
             browser: "Discord Android",
             device: "Pixel 8",
             system_locale,
-            client_version: "212.19 - pn",
+            client_version: "337.10",
             release_channel: "googleRelease",
             os_version: "34",
-            client_build_number: 212019,
+            client_build_number: 337010,
             client_event_source: null
         };
         
@@ -90,12 +91,19 @@ function patchSuperPropsBase64(existingBase64: string): string {
 }
 
 /**
- * Quest-related progress endpoints (enroll/heartbeat).
- * We require a trailing slash to explicitly avoid spoofing the main quest list endpoint 
- * (/users/@me/quests). Spoofing the list endpoint hides computer quests and returns 
- * empty if no mobile quests exist!
+ * All quest-related endpoints that need X-Super-Properties spoofed.
+ * This includes the main list fetch (/users/@me/quests) to ensure mobile quests are returned.
  */
 function isQuestUrl(url: string): boolean {
+    return url.includes("/quests") || url.includes("/drops");
+}
+
+/**
+ * Quest-related progress endpoints (enroll/heartbeat).
+ * We require a trailing slash to explicitly avoid spoofing the main quest list endpoint 
+ * (/users/@me/quests) with a mobile User-Agent, which would trigger Cloudflare blocks.
+ */
+function isQuestProgressUrl(url: string): boolean {
     return url.includes("/quests/") || url.includes("/drops/");
 }
 
@@ -144,7 +152,7 @@ export default definePlugin({
             return originalWsSend!.call(this, data);
         };
 
-        // ── 2. window.fetch — patch headers on quest progress endpoints ──────
+        // ── 2. window.fetch — patch headers on quest endpoints ───────────────
         originalFetch = window.fetch;
         window.fetch = function (input: RequestInfo | URL, init?: RequestInit) {
             try {
@@ -166,9 +174,11 @@ export default definePlugin({
                     headers.set("X-Super-Properties", patchSuperPropsBase64(existingProps));
                 }
 
-                // Spoof User-Agent for active progress endpoints
-                const { os } = getPlatformInfo();
-                headers.set("User-Agent", getSpoofedUserAgent(os));
+                // Spoof User-Agent ONLY for active progress endpoints
+                if (isQuestProgressUrl(url)) {
+                    const { os } = getPlatformInfo();
+                    headers.set("User-Agent", getSpoofedUserAgent(os));
+                }
 
                 if (input instanceof Request) {
                     return originalFetch!.call(this, new Request(input, { ...init, headers }));
@@ -180,7 +190,7 @@ export default definePlugin({
             }
         } as typeof window.fetch;
 
-        // ── 3. XMLHttpRequest — patch headers on quest progress endpoints ────
+        // ── 3. XMLHttpRequest — patch headers on quest endpoints ─────────────
         originalXhrOpen = XMLHttpRequest.prototype.open;
         originalXhrSetHeader = XMLHttpRequest.prototype.setRequestHeader;
 
@@ -198,7 +208,7 @@ export default definePlugin({
             const res = (originalXhrOpen as any).call(this, method, url, ...rest);
 
             // Set User-Agent for quest progress URLs on open
-            if (isDiscordApiUrl(urlStr) && isQuestUrl(urlStr)) {
+            if (isDiscordApiUrl(urlStr) && isQuestProgressUrl(urlStr)) {
                 try {
                     const { os } = getPlatformInfo();
                     originalXhrSetHeader!.call(this, "User-Agent", getSpoofedUserAgent(os));
@@ -218,7 +228,7 @@ export default definePlugin({
                 const lowerName = name.toLowerCase();
                 if (lowerName === "x-super-properties") {
                     value = patchSuperPropsBase64(value);
-                } else if (lowerName === "user-agent") {
+                } else if (lowerName === "user-agent" && isQuestProgressUrl(url)) {
                     const { os } = getPlatformInfo();
                     value = getSpoofedUserAgent(os);
                 }
