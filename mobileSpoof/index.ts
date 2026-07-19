@@ -45,7 +45,10 @@ const MOBILE_TASK_TYPES = ["WATCH_VIDEO_ON_MOBILE", "PLAY_ON_MOBILE", "STREAM_ON
 async function enrollInQuest(questId: string, questName: string) {
     try {
         console.log("[MobileSpoof] Enrolling in quest:", questId, questName);
-        const res = await RestAPI.post({ url: `/quests/${questId}/enroll` });
+        const res = await RestAPI.post({ 
+            url: `/quests/${questId}/enroll`,
+            body: { location: 2 }
+        });
         console.log("[MobileSpoof] Enroll response:", res?.status, res?.body);
 
         if (res?.ok || res?.status === 200 || res?.status === 201) {
