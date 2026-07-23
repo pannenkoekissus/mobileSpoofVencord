@@ -4,12 +4,10 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-import { showNotification } from "@api/Notifications";
 import { definePluginSettings } from "@api/Settings";
 import { Devs } from "@utils/constants";
 import definePlugin, { OptionType, StartAt } from "@utils/types";
 import { waitFor } from "@webpack";
-import { RestAPI } from "@webpack/common";
 
 // ─── Settings ────────────────────────────────────────────────────────────────
 
@@ -30,52 +28,10 @@ const settings = definePluginSettings({
 let originalWsSend: typeof WebSocket.prototype.send | null = null;
 let originalGetSuperProperties: any = null;
 let originalGetSuperPropertiesBase64: any = null;
-let uiInitTimeout: ReturnType<typeof setTimeout> | null = null;
 let patchedModule: any = null;
 let observer: MutationObserver | null = null;
-let floatingContainer: HTMLDivElement | null = null;
 let observerThrottle: ReturnType<typeof setTimeout> | null = null;
 let QuestsStore: any = null;
-
-// Task types that require a mobile device
-const MOBILE_TASK_TYPES = ["WATCH_VIDEO_ON_MOBILE", "PLAY_ON_MOBILE", "STREAM_ON_MOBILE", "COMPLETE_ON_MOBILE"];
-
-// ─── Quest Enrollment ─────────────────────────────────────────────────────────
-
-async function enrollInQuest(questId: string, questName: string) {
-    try {
-        console.log("[MobileSpoof] Enrolling in quest:", questId, questName);
-        const res = await RestAPI.post({
-            url: `/quests/${questId}/enroll`,
-            body: { location: 2 }
-        });
-        console.log("[MobileSpoof] Enroll response:", res?.status, res?.body);
-
-        if (res?.ok || res?.status === 200 || res?.status === 201) {
-            showNotification({
-                title: "📱 Mobile Quest Started!",
-                body: `Enrolled in "${questName}".`,
-                color: "#3ba55c"
-            });
-            // Update UI and re-run store patch
-            patchQuestsInStore();
-            updateFloatingUI();
-        } else {
-            showNotification({
-                title: "Enrollment Failed",
-                body: `Status ${res?.status}: ${JSON.stringify(res?.body ?? {})}`,
-                color: "#ed4245"
-            });
-        }
-    } catch (e: any) {
-        console.error("[MobileSpoof] Enroll error:", e);
-        showNotification({
-            title: "Enrollment Error",
-            body: String(e?.message ?? e),
-            color: "#ed4245"
-        });
-    }
-}
 
 // ─── Quest Store Patching (Converts Mobile tasks to Desktop tasks) ─────────────
 
@@ -128,63 +84,13 @@ function patchQuestsInStore() {
     }
 }
 
-// ─── Floating UI ──────────────────────────────────────────────────────────────
-
-function updateFloatingUI() {
-    if (!floatingContainer) return;
-    const wrapper = document.getElementById("vc-mobile-spoof-float");
-
-    if (!QuestsStore) {
-        if (wrapper) wrapper.style.display = "none";
-        return;
-    }
-
-    const allQuests = [...(QuestsStore.quests?.values() ?? [])];
-
-    // Detect mobile quests (original configs might have been patched, check both maps)
-    const mobileQuests = allQuests.filter((q: any) => {
-        const taskConfig = q?.config?.taskConfig ?? q?.config?.taskConfigV2;
-        if (!taskConfig?.tasks) return false;
-        return (
-            taskConfig.tasks.WATCH_VIDEO_ON_MOBILE != null ||
-            taskConfig.tasks.PLAY_ON_MOBILE != null ||
-            // Or if we already patched it (we log it for the floating UI status)
-            ((q.config?.platforms?.includes(1) ?? false) && (taskConfig.tasks.WATCH_VIDEO != null || taskConfig.tasks.PLAY_ON_DESKTOP != null))
-        );
-    });
-
-    console.log("[MobileSpoof] Mobile quests found:", mobileQuests.length, "/", allQuests.length);
-
-    if (mobileQuests.length === 0) {
-        if (wrapper) wrapper.style.display = "none";
-        return;
-    }
-
-    // Disconnect MutationObserver temporarily during DOM modification to prevent infinite self-triggers
-    if (observer) observer.disconnect();
-
-    // Build floating button HTML
-    floatingContainer.innerHTML = "";
-    if (wrapper) wrapper.style.display = "flex";
-
-
-    // Re-observe the document body
-    if (observer && document.body) {
-        observer.observe(document.body, { childList: true, subtree: true });
-    }
-}
-
-function createFloatingUI() {
-    return
-}
-
 // ─── Plugin ───────────────────────────────────────────────────────────────────
 
 export default definePlugin({
     name: "MobileSpoof",
     description: "Makes Discord think you are on mobile — shows mobile status indicator and allows mobile-only quests.",
     tags: ["Utility", "Privacy"],
-    authors: [Devs.Ven],
+    authors: ["pannenkoekissus"],
     settings,
     startAt: StartAt.Init,
 
@@ -218,7 +124,7 @@ export default definePlugin({
             originalGetSuperProperties = mod.getSuperProperties;
             originalGetSuperPropertiesBase64 = mod.getSuperPropertiesBase64;
 
-            mod.getSuperProperties = function () {
+            const patchedGetSuperProperties = function () {
                 const props = originalGetSuperProperties.apply(this, arguments);
                 const isIOS = settings.store.mobilePlatform === "iOS";
                 props.os = isIOS ? "iOS" : "Android";
@@ -230,10 +136,27 @@ export default definePlugin({
                 return props;
             };
 
-            mod.getSuperPropertiesBase64 = function () {
-                const props = mod.getSuperProperties.apply(this, arguments);
+            const patchedGetSuperPropertiesBase64 = function () {
+                const props = patchedGetSuperProperties.apply(this, arguments);
                 return btoa(unescape(encodeURIComponent(JSON.stringify(props))));
             };
+
+            try {
+                Object.defineProperty(mod, "getSuperProperties", {
+                    value: patchedGetSuperProperties,
+                    configurable: true,
+                    writable: true
+                });
+                Object.defineProperty(mod, "getSuperPropertiesBase64", {
+                    value: patchedGetSuperPropertiesBase64,
+                    configurable: true,
+                    writable: true
+                });
+            } catch (e) {
+                // Fallback to direct assignment
+                mod.getSuperProperties = patchedGetSuperProperties;
+                mod.getSuperPropertiesBase64 = patchedGetSuperPropertiesBase64;
+            }
         });
 
         // ── 3. QuestsStore — wait for load and retrieve ──────────────────────
@@ -241,42 +164,66 @@ export default definePlugin({
             if (!originalWsSend) return;
             QuestsStore = store;
             patchQuestsInStore();
-            updateFloatingUI();
         });
 
-        // ── 4. Floating UI & Patch loop ──────────────────────────────────────
+        // ── 4. Observation Loop for dynamic Quests updates ──────────────────
         observer = new MutationObserver(() => {
             if (observerThrottle) clearTimeout(observerThrottle);
             observerThrottle = setTimeout(() => {
                 patchQuestsInStore();
-                updateFloatingUI();
             }, 500);
         });
 
-        const initUI = () => {
+        const initObserver = () => {
             if (!document.body) {
-                uiInitTimeout = setTimeout(initUI, 100);
+                setTimeout(initObserver, 100);
                 return;
             }
-            createFloatingUI();
             patchQuestsInStore();
-            updateFloatingUI();
             observer!.observe(document.body, { childList: true, subtree: true });
         };
-        initUI();
+        initObserver();
     },
 
     stop() {
-        if (uiInitTimeout) { clearTimeout(uiInitTimeout); uiInitTimeout = null; }
-        if (originalWsSend) { WebSocket.prototype.send = originalWsSend; originalWsSend = null; }
+        if (originalWsSend) {
+            WebSocket.prototype.send = originalWsSend;
+            originalWsSend = null;
+        }
+
         if (patchedModule) {
-            if (originalGetSuperProperties) { patchedModule.getSuperProperties = originalGetSuperProperties; originalGetSuperProperties = null; }
-            if (originalGetSuperPropertiesBase64) { patchedModule.getSuperPropertiesBase64 = originalGetSuperPropertiesBase64; originalGetSuperPropertiesBase64 = null; }
+            try {
+                if (originalGetSuperProperties) {
+                    Object.defineProperty(patchedModule, "getSuperProperties", {
+                        value: originalGetSuperProperties,
+                        configurable: true,
+                        writable: true
+                    });
+                }
+                if (originalGetSuperPropertiesBase64) {
+                    Object.defineProperty(patchedModule, "getSuperPropertiesBase64", {
+                        value: originalGetSuperPropertiesBase64,
+                        configurable: true,
+                        writable: true
+                    });
+                }
+            } catch (e) {
+                if (originalGetSuperProperties) patchedModule.getSuperProperties = originalGetSuperProperties;
+                if (originalGetSuperPropertiesBase64) patchedModule.getSuperPropertiesBase64 = originalGetSuperPropertiesBase64;
+            }
+            originalGetSuperProperties = null;
+            originalGetSuperPropertiesBase64 = null;
             patchedModule = null;
         }
-        if (observer) { observer.disconnect(); observer = null; }
-        document.getElementById("vc-mobile-spoof-float")?.remove();
-        floatingContainer = null;
+
+        if (observer) {
+            observer.disconnect();
+            observer = null;
+        }
+        if (observerThrottle) {
+            clearTimeout(observerThrottle);
+            observerThrottle = null;
+        }
         QuestsStore = null;
     }
 });
