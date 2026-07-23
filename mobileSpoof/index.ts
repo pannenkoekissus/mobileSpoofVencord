@@ -45,7 +45,7 @@ const MOBILE_TASK_TYPES = ["WATCH_VIDEO_ON_MOBILE", "PLAY_ON_MOBILE", "STREAM_ON
 async function enrollInQuest(questId: string, questName: string) {
     try {
         console.log("[MobileSpoof] Enrolling in quest:", questId, questName);
-        const res = await RestAPI.post({ 
+        const res = await RestAPI.post({
             url: `/quests/${questId}/enroll`,
             body: { location: 2 }
         });
@@ -113,7 +113,7 @@ function patchQuestsInStore() {
 
         if (modified) {
             anyModified = true;
-            console.log("[MobileSpoof] Patched quest to desktop type in store:", quest.id, 
+            console.log("[MobileSpoof] Patched quest to desktop type in store:", quest.id,
                 quest.config?.messages?.questName ?? quest.config?.application?.name);
         }
     }
@@ -146,10 +146,10 @@ function updateFloatingUI() {
         const taskConfig = q?.config?.taskConfig ?? q?.config?.taskConfigV2;
         if (!taskConfig?.tasks) return false;
         return (
-            taskConfig.tasks.WATCH_VIDEO_ON_MOBILE != null || 
+            taskConfig.tasks.WATCH_VIDEO_ON_MOBILE != null ||
             taskConfig.tasks.PLAY_ON_MOBILE != null ||
             // Or if we already patched it (we log it for the floating UI status)
-            (q.config.platforms.includes(1) && (taskConfig.tasks.WATCH_VIDEO != null || taskConfig.tasks.PLAY_ON_DESKTOP != null))
+            ((q.config?.platforms?.includes(1) ?? false) && (taskConfig.tasks.WATCH_VIDEO != null || taskConfig.tasks.PLAY_ON_DESKTOP != null))
         );
     });
 
@@ -167,40 +167,6 @@ function updateFloatingUI() {
     floatingContainer.innerHTML = "";
     if (wrapper) wrapper.style.display = "flex";
 
-    for (const quest of mobileQuests) {
-        const questId: string = quest.id;
-        const questName: string =
-            quest.config?.messages?.questName ??
-            quest.config?.application?.name ??
-            `Quest ${questId}`;
-        const isEnrolled = !!quest.userStatus?.enrolledAt;
-        const isCompleted = !!quest.userStatus?.completedAt;
-
-        const btn = document.createElement("button");
-        btn.style.cssText = `
-            background: ${isCompleted ? "#23a55a" : isEnrolled ? "#5865f2" : "#ed4245"};
-            color: white;
-            border: none;
-            border-radius: 4px;
-            padding: 8px 12px;
-            font-size: 13px;
-            font-weight: 600;
-            cursor: ${isEnrolled || isCompleted ? "default" : "pointer"};
-            margin: 2px 0;
-            font-family: inherit;
-        `;
-        btn.textContent = isCompleted
-            ? `✅ ${questName}`
-            : isEnrolled
-                ? `📱 ${questName} (enrolled)`
-                : `📱 Start: ${questName}`;
-
-        if (!isEnrolled && !isCompleted) {
-            btn.style.cursor = "pointer";
-            btn.addEventListener("click", () => enrollInQuest(questId, questName));
-        }
-        floatingContainer.appendChild(btn);
-    }
 
     // Re-observe the document body
     if (observer && document.body) {
@@ -209,38 +175,7 @@ function updateFloatingUI() {
 }
 
 function createFloatingUI() {
-    if (floatingContainer) return;
-
-    const wrapper = document.createElement("div");
-    wrapper.id = "vc-mobile-spoof-float";
-    wrapper.style.cssText = `
-        position: fixed;
-        bottom: 60px;
-        right: 16px;
-        z-index: 9999;
-        display: none;
-        flex-direction: column;
-        gap: 4px;
-        pointer-events: all;
-        background: rgba(30,31,34,0.95);
-        border: 1px solid #5865f2;
-        border-radius: 8px;
-        padding: 10px;
-        box-shadow: 0 4px 24px rgba(0,0,0,0.5);
-        min-width: 220px;
-        max-width: 320px;
-    `;
-
-    const label = document.createElement("div");
-    label.style.cssText = "color: #b5bac1; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: 4px; font-family: inherit;";
-    label.textContent = "📱 Mobile Quests";
-    wrapper.appendChild(label);
-
-    floatingContainer = document.createElement("div");
-    floatingContainer.style.cssText = "display: flex; flex-direction: column; gap: 4px;";
-    wrapper.appendChild(floatingContainer);
-
-    document.body.appendChild(wrapper);
+    return
 }
 
 // ─── Plugin ───────────────────────────────────────────────────────────────────
