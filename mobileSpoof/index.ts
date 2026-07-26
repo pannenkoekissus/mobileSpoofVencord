@@ -14,7 +14,7 @@ import { waitFor } from "@webpack";
 const settings = definePluginSettings({
     mobilePlatform: {
         type: OptionType.SELECT,
-        description: "The mobile platform to spoof. Requires Discord reload to take effect.",
+        description: "The mobile platform to spoof.",
         options: [
             { label: "Android", value: "Android", default: true },
             { label: "iOS", value: "iOS" }
@@ -33,32 +33,76 @@ let observer: MutationObserver | null = null;
 let observerThrottle: ReturnType<typeof setTimeout> | null = null;
 let QuestsStore: any = null;
 
-// The live gateway WebSocket — captured automatically via the send hook.
+// The live gateway WebSocket — captured via the constructor hook when Discord
+// creates a new gateway connection after we force a reconnect.
 let gatewaySocket: WebSocket | null = null;
-// Set to true when a reconnect is requested but the socket isn't captured yet.
-let pendingReconnect = false;
+
+// Reconnect state machine:
+//  "idle"     – normal
+//  "blocking" – next RESUME (op 6) on a new socket should be blocked and
+//               replaced with a fake Invalid Session (op 9) so Discord sends
+//               a fresh IDENTIFY (op 2) that our send hook can patch.
+let reconnectState: "idle" | "blocking" = "idle";
+
+// Saved original WebSocket constructor so we can restore it on stop().
+const OriginalWebSocket: typeof WebSocket = window.WebSocket;
+
+// ─── WebSocket Constructor Hook ───────────────────────────────────────────────
+// Wraps window.WebSocket so we capture every new gateway socket the moment it
+// is created — even when the existing socket was set up before our send hook.
+
+function installConstructorHook() {
+    (window as any).WebSocket = function (this: any, url: string | URL, protocols?: any) {
+        const ws = new OriginalWebSocket(url, protocols);
+        if (String(url).includes("gateway")) {
+            gatewaySocket = ws;
+            console.log("[MobileSpoof] New gateway socket captured via constructor hook.");
+
+            // Fallback: if the send hook never sees the RESUME (e.g. Discord bound
+            // its send before our prototype patch), inject op 9 after Discord has had
+            // ~600 ms to receive the server Hello and queue its RESUME send.
+            if (reconnectState === "blocking") {
+                ws.addEventListener("open", () => {
+                    setTimeout(() => {
+                        if (reconnectState === "blocking" && ws.readyState === WebSocket.OPEN) {
+                            reconnectState = "idle";
+                            console.log("[MobileSpoof] Fallback: injecting op 9 via constructor hook.");
+                            ws.dispatchEvent(new MessageEvent("message", {
+                                data: JSON.stringify({ op: 9, d: false })
+                            }));
+                        }
+                    }, 600);
+                });
+            }
+        }
+        return ws;
+    } as any;
+    (window as any).WebSocket.prototype = OriginalWebSocket.prototype;
+    Object.keys(OriginalWebSocket).forEach(k => {
+        try { (window.WebSocket as any)[k] = (OriginalWebSocket as any)[k]; } catch { }
+    });
+}
+
+function removeConstructorHook() {
+    (window as any).WebSocket = OriginalWebSocket;
+}
 
 // ─── Gateway Reconnect Helper ─────────────────────────────────────────────────
 
-function injectInvalidSession(ws: WebSocket) {
-    // Inject a fake "Invalid Session" (op 9, d: false).
-    // Discord's handler clears the session and sends a fresh IDENTIFY (op 2)
-    // on reconnect — our send patch then adds mobile properties.
-    ws.dispatchEvent(new MessageEvent("message", {
-        data: JSON.stringify({ op: 9, d: false })
-    }));
-    console.log("[MobileSpoof] Injected op 9 — Discord will reconnect with fresh IDENTIFY.");
-}
-
 function forceGatewayReconnect() {
+    reconnectState = "blocking";
+
     if (gatewaySocket?.readyState === WebSocket.OPEN) {
-        injectInvalidSession(gatewaySocket);
+        // We already have the socket from a previous capture — close it directly.
+        console.log("[MobileSpoof] Closing captured gateway socket, blocking next RESUME...");
+        gatewaySocket.close(1000);
     } else {
-        // Socket not captured yet (plugin just started mid-session).
-        // The send hook will fire the injection the next time Discord sends
-        // anything on the gateway (heartbeat every ~41s, usually much sooner).
-        console.log("[MobileSpoof] Socket not ready — will reconnect on next gateway send.");
-        pendingReconnect = true;
+        // Existing socket was bound before our patch — trigger reconnect via
+        // network-loss simulation. Discord will create a NEW socket (captured by
+        // our constructor hook) and send RESUME, which the send hook will block.
+        console.log("[MobileSpoof] Triggering reconnect via network simulation...");
+        window.dispatchEvent(new Event("offline"));
+        setTimeout(() => window.dispatchEvent(new Event("online")), 2000);
     }
 }
 
@@ -71,7 +115,6 @@ function patchQuestsInStore() {
     for (const quest of QuestsStore.quests.values()) {
         let modified = false;
 
-        // 1. Ensure platform 1 (Desktop) is supported so card is not locked/hidden
         if (quest.config && Array.isArray(quest.config.platforms)) {
             if (!quest.config.platforms.includes(1)) {
                 quest.config.platforms.push(1);
@@ -79,16 +122,13 @@ function patchQuestsInStore() {
             }
         }
 
-        // 2. Map mobile task types to desktop task types so UI renders official buttons
         const taskConfig = quest.config?.taskConfig ?? quest.config?.taskConfigV2;
         if (taskConfig?.tasks) {
-            // Video task mapping
             if (taskConfig.tasks.WATCH_VIDEO_ON_MOBILE && !taskConfig.tasks.WATCH_VIDEO) {
                 taskConfig.tasks.WATCH_VIDEO = taskConfig.tasks.WATCH_VIDEO_ON_MOBILE;
                 delete taskConfig.tasks.WATCH_VIDEO_ON_MOBILE;
                 modified = true;
             }
-            // Game activity task mapping
             if (taskConfig.tasks.PLAY_ON_MOBILE && !taskConfig.tasks.PLAY_ON_DESKTOP) {
                 taskConfig.tasks.PLAY_ON_DESKTOP = taskConfig.tasks.PLAY_ON_MOBILE;
                 delete taskConfig.tasks.PLAY_ON_MOBILE;
@@ -98,18 +138,14 @@ function patchQuestsInStore() {
 
         if (modified) {
             anyModified = true;
-            console.log("[MobileSpoof] Patched quest to desktop type in store:", quest.id,
+            console.log("[MobileSpoof] Patched quest:", quest.id,
                 quest.config?.messages?.questName ?? quest.config?.application?.name);
         }
     }
 
     if (anyModified) {
-        try {
-            // Trigger Flux store update so React UI refreshes and shows official buttons
-            QuestsStore.emitChange();
-        } catch (e) {
-            console.error("[MobileSpoof] emitChange error:", e);
-        }
+        try { QuestsStore.emitChange(); }
+        catch (e) { console.error("[MobileSpoof] emitChange error:", e); }
     }
 }
 
@@ -124,34 +160,51 @@ export default definePlugin({
     startAt: StartAt.Init,
 
     start() {
-        // ── 1. WebSocket — patch Gateway IDENTIFY + capture socket reference ──
-        originalWsSend = WebSocket.prototype.send;
-        WebSocket.prototype.send = function (this: WebSocket, data: any) {
+        // ── 0. Constructor hook — must be first so we capture all new sockets ──
+        installConstructorHook();
+
+        // ── 1. WebSocket send hook — patches IDENTIFY + blocks RESUME ─────────
+        originalWsSend = OriginalWebSocket.prototype.send;
+        OriginalWebSocket.prototype.send = function (this: WebSocket, data: any) {
+            let blockSend = false;
+
             if (typeof data === "string") {
                 try {
                     const isGateway = typeof this.url === "string" &&
                         (this.url.includes("gateway.discord.gg") || this.url.includes("gateway"));
-                    if (isGateway) {
-                        // Capture the live gateway socket whenever Discord sends on it
-                        gatewaySocket = this;
 
-                        // If a reconnect was requested before we had the socket, fire it now
-                        if (pendingReconnect) {
-                            pendingReconnect = false;
-                            setTimeout(() => injectInvalidSession(this), 0);
+                    if (isGateway) {
+                        const parsed = JSON.parse(data);
+
+                        // "blocking": intercept RESUME (op 6) on the new socket.
+                        // Block it and inject a fake Invalid Session (op 9) so
+                        // Discord clears its session and sends a fresh IDENTIFY.
+                        if (reconnectState === "blocking" && parsed.op === 6) {
+                            blockSend = true;
+                            reconnectState = "idle";
+                            const ws = this;
+                            console.log("[MobileSpoof] Blocked RESUME (op 6), injecting Invalid Session (op 9)...");
+                            setTimeout(() => {
+                                ws.dispatchEvent(new MessageEvent("message", {
+                                    data: JSON.stringify({ op: 9, d: false })
+                                }));
+                            }, 50);
                         }
 
-                        const parsed = JSON.parse(data);
+                        // Always patch IDENTIFY (op 2) with mobile platform properties.
                         if (parsed.op === 2 && parsed.d?.properties) {
                             const isIOS = settings.store.mobilePlatform === "iOS";
                             parsed.d.properties.$os = isIOS ? "iOS" : "Android";
                             parsed.d.properties.$browser = isIOS ? "Discord iOS" : "Discord Android";
                             parsed.d.properties.$device = isIOS ? "Discord iOS" : "Discord Android";
                             data = JSON.stringify(parsed);
+                            console.log("[MobileSpoof] Patched IDENTIFY with mobile platform.");
                         }
                     }
                 } catch { /* ignore */ }
             }
+
+            if (blockSend) return;
             return originalWsSend!.call(this, data);
         };
 
@@ -196,26 +249,21 @@ export default definePlugin({
             }
         });
 
-        // ── 3. QuestsStore — wait for load and retrieve ──────────────────────
+        // ── 3. QuestsStore — wait for load, then patch ───────────────────────
         waitFor(["getQuest", "quests"], store => {
             if (!originalWsSend) return;
             QuestsStore = store;
             patchQuestsInStore();
         });
 
-        // ── 4. Observation Loop for dynamic Quests updates ──────────────────
+        // ── 4. MutationObserver for dynamic quest updates ────────────────────
         observer = new MutationObserver(() => {
             if (observerThrottle) clearTimeout(observerThrottle);
-            observerThrottle = setTimeout(() => {
-                patchQuestsInStore();
-            }, 500);
+            observerThrottle = setTimeout(() => patchQuestsInStore(), 500);
         });
 
         const initObserver = () => {
-            if (!document.body) {
-                setTimeout(initObserver, 100);
-                return;
-            }
+            if (!document.body) { setTimeout(initObserver, 100); return; }
             patchQuestsInStore();
             observer!.observe(document.body, { childList: true, subtree: true });
         };
@@ -226,13 +274,13 @@ export default definePlugin({
     },
 
     stop() {
-        // Trigger reconnect BEFORE removing the send hook so the socket ref is still valid
-        forceGatewayReconnect();
-        gatewaySocket = null;
-        pendingReconnect = false;
+        reconnectState = "idle";
+
+        // Remove the constructor hook first so future sockets use the real class.
+        removeConstructorHook();
 
         if (originalWsSend) {
-            WebSocket.prototype.send = originalWsSend;
+            OriginalWebSocket.prototype.send = originalWsSend;
             originalWsSend = null;
         }
 
@@ -261,14 +309,13 @@ export default definePlugin({
             patchedModule = null;
         }
 
-        if (observer) {
-            observer.disconnect();
-            observer = null;
-        }
-        if (observerThrottle) {
-            clearTimeout(observerThrottle);
-            observerThrottle = null;
-        }
+        if (observer) { observer.disconnect(); observer = null; }
+        if (observerThrottle) { clearTimeout(observerThrottle); observerThrottle = null; }
         QuestsStore = null;
+
+        // Close the socket so Discord reconnects (without our patches active, it
+        // will RESUME normally and the mobile status fades on session expiry).
+        gatewaySocket?.close(1000);
+        gatewaySocket = null;
     }
 });
