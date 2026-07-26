@@ -19,7 +19,7 @@ const settings = definePluginSettings({
             { label: "Android", value: "Android", default: true },
             { label: "iOS", value: "iOS" }
         ],
-        restartNeeded: true
+        restartNeeded: false
     }
 });
 
@@ -32,6 +32,35 @@ let patchedModule: any = null;
 let observer: MutationObserver | null = null;
 let observerThrottle: ReturnType<typeof setTimeout> | null = null;
 let QuestsStore: any = null;
+
+// The live gateway WebSocket — captured automatically via the send hook.
+let gatewaySocket: WebSocket | null = null;
+// Set to true when a reconnect is requested but the socket isn't captured yet.
+let pendingReconnect = false;
+
+// ─── Gateway Reconnect Helper ─────────────────────────────────────────────────
+
+function injectInvalidSession(ws: WebSocket) {
+    // Inject a fake "Invalid Session" (op 9, d: false).
+    // Discord's handler clears the session and sends a fresh IDENTIFY (op 2)
+    // on reconnect — our send patch then adds mobile properties.
+    ws.dispatchEvent(new MessageEvent("message", {
+        data: JSON.stringify({ op: 9, d: false })
+    }));
+    console.log("[MobileSpoof] Injected op 9 — Discord will reconnect with fresh IDENTIFY.");
+}
+
+function forceGatewayReconnect() {
+    if (gatewaySocket?.readyState === WebSocket.OPEN) {
+        injectInvalidSession(gatewaySocket);
+    } else {
+        // Socket not captured yet (plugin just started mid-session).
+        // The send hook will fire the injection the next time Discord sends
+        // anything on the gateway (heartbeat every ~41s, usually much sooner).
+        console.log("[MobileSpoof] Socket not ready — will reconnect on next gateway send.");
+        pendingReconnect = true;
+    }
+}
 
 // ─── Quest Store Patching (Converts Mobile tasks to Desktop tasks) ─────────────
 
@@ -95,7 +124,7 @@ export default definePlugin({
     startAt: StartAt.Init,
 
     start() {
-        // ── 1. WebSocket — patch Gateway IDENTIFY (mobile status dot) ─────────
+        // ── 1. WebSocket — patch Gateway IDENTIFY + capture socket reference ──
         originalWsSend = WebSocket.prototype.send;
         WebSocket.prototype.send = function (this: WebSocket, data: any) {
             if (typeof data === "string") {
@@ -103,6 +132,15 @@ export default definePlugin({
                     const isGateway = typeof this.url === "string" &&
                         (this.url.includes("gateway.discord.gg") || this.url.includes("gateway"));
                     if (isGateway) {
+                        // Capture the live gateway socket whenever Discord sends on it
+                        gatewaySocket = this;
+
+                        // If a reconnect was requested before we had the socket, fire it now
+                        if (pendingReconnect) {
+                            pendingReconnect = false;
+                            setTimeout(() => injectInvalidSession(this), 0);
+                        }
+
                         const parsed = JSON.parse(data);
                         if (parsed.op === 2 && parsed.d?.properties) {
                             const isIOS = settings.store.mobilePlatform === "iOS";
@@ -153,7 +191,6 @@ export default definePlugin({
                     writable: true
                 });
             } catch (e) {
-                // Fallback to direct assignment
                 mod.getSuperProperties = patchedGetSuperProperties;
                 mod.getSuperPropertiesBase64 = patchedGetSuperPropertiesBase64;
             }
@@ -183,9 +220,17 @@ export default definePlugin({
             observer!.observe(document.body, { childList: true, subtree: true });
         };
         initObserver();
+
+        // ── 5. Force reconnect so mobile status appears immediately ──────────
+        forceGatewayReconnect();
     },
 
     stop() {
+        // Trigger reconnect BEFORE removing the send hook so the socket ref is still valid
+        forceGatewayReconnect();
+        gatewaySocket = null;
+        pendingReconnect = false;
+
         if (originalWsSend) {
             WebSocket.prototype.send = originalWsSend;
             originalWsSend = null;
