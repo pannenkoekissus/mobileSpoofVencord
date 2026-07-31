@@ -12,6 +12,12 @@ import { FluxDispatcher } from "@webpack/common";
 // ─── Settings ────────────────────────────────────────────────────────────────
 
 const settings = definePluginSettings({
+    spoofMobileStatus: {
+        type: OptionType.BOOLEAN,
+        description: "Spoof platform to Mobile (shows mobile phone icon).",
+        default: true,
+        restartNeeded: true
+    },
     mobilePlatform: {
         type: OptionType.SELECT,
         description: "The mobile platform to spoof.",
@@ -19,6 +25,12 @@ const settings = definePluginSettings({
             { label: "Android", value: "Android", default: true },
             { label: "iOS", value: "iOS" }
         ],
+        restartNeeded: true
+    },
+    enableMobileQuests: {
+        type: OptionType.BOOLEAN,
+        description: "Allow completing mobile-only quests on Desktop.",
+        default: true,
         restartNeeded: true
     }
 });
@@ -52,6 +64,8 @@ function getMobileSuperProperties(isIOS: boolean) {
 // presence backend to flag the session as a Desktop client.
 
 (window as any).__getMobileProps = function (origProps: any) {
+    if (!settings.store?.spoofMobileStatus) return origProps;
+
     const isIOS = settings.store?.mobilePlatform === "iOS";
     const mobile = getMobileSuperProperties(isIOS);
 
@@ -115,6 +129,7 @@ function onConnectionOpen() {
 // ─── Quest Store Patching ─────────────────────────────────────────────────────
 
 function patchQuestsInStore() {
+    if (!settings.store?.enableMobileQuests) return;
     if (!QuestsStore || !QuestsStore.quests) return;
     for (const quest of QuestsStore.quests.values()) {
         if (quest.config && Array.isArray(quest.config.platforms)) {
