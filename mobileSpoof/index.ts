@@ -149,19 +149,6 @@ export default definePlugin({
     // Patch super properties and Gateway IDENTIFY directly inside the identify() method
     patches: [
         {
-            find: "getSuperProperties:()=>",
-            replacement: [
-                {
-                    match: /getSuperProperties:\(\)=>([a-zA-Z0-9_$]+)/,
-                    replace: "getSuperProperties:()=>(function(){var fn=$1;return window.__getMobileProps?window.__getMobileProps(fn()):fn()})"
-                },
-                {
-                    match: /getSuperPropertiesBase64:\(\)=>([a-zA-Z0-9_$]+)/,
-                    replace: "getSuperPropertiesBase64:()=>(function(){var fn=$1;return window.__getMobilePropsBase64?window.__getMobilePropsBase64(fn()):fn()})"
-                }
-            ]
-        },
-        {
             find: '"[IDENTIFY]"',
             replacement: {
                 match: /properties:([a-zA-Z0-9_$]+),presence:/,
