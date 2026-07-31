@@ -6,7 +6,8 @@
 
 import { definePluginSettings } from "@api/Settings";
 import definePlugin, { OptionType, StartAt } from "@utils/types";
-import { waitFor } from "@webpack";
+import { waitFor, findByProps } from "@webpack";
+import { FluxDispatcher } from "@webpack/common";
 
 // ─── Settings ────────────────────────────────────────────────────────────────
 
@@ -87,6 +88,30 @@ let observer: MutationObserver | null = null;
 let observerThrottle: ReturnType<typeof setTimeout> | null = null;
 let QuestsStore: any = null;
 
+function checkAndForceReconnect() {
+    const gatewayStore = findByProps("getSocket");
+    if (!gatewayStore) return;
+
+    const socket = gatewayStore.getSocket?.();
+    if (!socket) return;
+
+    // If the server thinks we are a desktop client, our spoof hasn't taken effect on this session.
+    // This happens if the session was RESUMED (e.g. via Ctrl+R) instead of a fresh IDENTIFY.
+    console.log("[MobileSpoof] Forcing clean IDENTIFY reconnect...");
+    try {
+        if (typeof socket._handleInvalidSession === "function") {
+            socket._handleInvalidSession(false);
+        }
+    } catch (e) {
+        console.error("[MobileSpoof] Reconnect error:", e);
+    }
+}
+
+function onConnectionOpen() {
+    // Wait a bit for sessions to populate after connection
+    setTimeout(checkAndForceReconnect, 3000);
+}
+
 // ─── Quest Store Patching ─────────────────────────────────────────────────────
 
 function patchQuestsInStore() {
@@ -109,7 +134,7 @@ function patchQuestsInStore() {
             }
         }
     }
-    try { QuestsStore.emitChange(); } catch {}
+    try { QuestsStore.emitChange(); } catch { }
 }
 
 // ─── Plugin Definition ────────────────────────────────────────────────────────
@@ -153,6 +178,8 @@ export default definePlugin({
             patchQuestsInStore();
         });
 
+        setTimeout(() => checkAndForceReconnect(), 20000);
+
         observer = new MutationObserver(() => {
             if (observerThrottle) clearTimeout(observerThrottle);
             observerThrottle = setTimeout(() => patchQuestsInStore(), 500);
@@ -170,6 +197,18 @@ export default definePlugin({
         if (observer) { observer.disconnect(); observer = null; }
         if (observerThrottle) { clearTimeout(observerThrottle); observerThrottle = null; }
         QuestsStore = null;
-        console.log("[MobileSpoof] Plugin stopped. Reload Discord to return to Desktop presence.");
+
+        FluxDispatcher.unsubscribe("CONNECTION_OPEN", onConnectionOpen);
+        FluxDispatcher.unsubscribe("SESSIONS_REPLACE", checkAndForceReconnect);
+
+        // Revert to desktop presence
+        const gatewayStore = findByProps("getSocket");
+        if (gatewayStore) {
+            const socket = gatewayStore.getSocket?.();
+            if (socket && typeof socket._handleInvalidSession === "function") {
+                socket._handleInvalidSession(false);
+            }
+        }
+        console.log("[MobileSpoof] Plugin stopped. Gateway reconnected to return to Desktop presence.");
     }
 });
