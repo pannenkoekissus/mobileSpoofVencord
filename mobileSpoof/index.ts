@@ -103,6 +103,7 @@ let observerThrottle: ReturnType<typeof setTimeout> | null = null;
 let QuestsStore: any = null;
 
 function checkAndForceReconnect() {
+    if (!settings.store?.spoofMobileStatus) return;
     const gatewayStore = findByProps("getSocket");
     if (!gatewayStore) return;
 
